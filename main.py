@@ -1,462 +1,669 @@
 import os
-import base64
+import time
+import threading
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, Response, render_template_string
+import cv2
+import numpy as np
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# =========================================================
-# ALUCARD V2 — ANDROID SCREEN FEED SERVER
-# =========================================================
+# ============================================================
+# ALUCARD CONFIGURATION
+# ============================================================
 
-SCREEN_TOKEN = os.environ.get("ALUCARD_SCREEN_TOKEN", "").strip()
+APP_NAME = "ALUCARD SIGNAL BOT"
+FEED_URL = os.getenv("RTSP_FEED_URL", "").strip()
 
-latest_frame = None
-latest_received = None
-latest_size = 0
+ANALYSIS_SECONDS = int(os.getenv("ANALYSIS_SECONDS", "3"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "70"))
 
+# ============================================================
+# SHARED STATE
+# ============================================================
 
-def now_utc():
-    return datetime.now(timezone.utc)
+state = {
+    "connected": False,
+    "feed": "NOT CONFIGURED",
+    "signal": "WAIT",
+    "confidence": 0,
+    "price": 0,
+    "trend": "UNKNOWN",
+    "rsi": 50,
+    "ema_fast": 0,
+    "ema_slow": 0,
+    "candle_count": 0,
+    "last_update": "Never",
+    "message": "Waiting for screen feed...",
+    "scan": 0,
+}
 
-
-def now_iso():
-    return now_utc().isoformat()
-
-
-def authorized(req):
-    if not SCREEN_TOKEN:
-        return False
-
-    token = req.headers.get("X-Alucard-Token", "").strip()
-
-    if not token:
-        auth = req.headers.get("Authorization", "")
-        if auth.lower().startswith("bearer "):
-            token = auth[7:].strip()
-
-    return token == SCREEN_TOKEN
-
-
-def store_frame(data):
-    global latest_frame
-    global latest_received
-    global latest_size
-
-    latest_frame = data
-    latest_received = now_iso()
-    latest_size = len(data)
+lock = threading.Lock()
 
 
-# =========================================================
-# HEALTH
-# =========================================================
+# ============================================================
+# INDICATORS
+# ============================================================
 
-@app.get("/health")
-def health():
+def ema(values, period):
+    if len(values) < period:
+        return None
 
-    return jsonify({
-        "status": "ok",
-        "service": "ALUCARD V2",
-        "screen_endpoint": "/api/screen"
-    })
+    values = np.asarray(values, dtype=float)
+    alpha = 2.0 / (period + 1.0)
+
+    result = values[0]
+
+    for value in values[1:]:
+        result = alpha * value + (1 - alpha) * result
+
+    return float(result)
 
 
-# =========================================================
-# RECEIVE ANDROID SCREEN FRAME
-# =========================================================
+def calculate_rsi(values, period=14):
+    if len(values) < period + 1:
+        return 50.0
 
-@app.post("/api/screen")
-def receive_screen():
+    values = np.asarray(values, dtype=float)
+    differences = np.diff(values)
 
-    if not authorized(request):
-        return jsonify({
-            "ok": False,
-            "error": "Unauthorized"
-        }), 401
+    gains = np.where(differences > 0, differences, 0)
+    losses = np.where(differences < 0, -differences, 0)
 
-    image_data = None
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
 
-    # -----------------------------------------
-    # Method 1: multipart image upload
-    # -----------------------------------------
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
 
-    if "image" in request.files:
+    rs = avg_gain / avg_loss
+    return float(100 - (100 / (1 + rs)))
 
-        uploaded = request.files["image"]
 
-        image_data = uploaded.read()
+# ============================================================
+# SCREEN ANALYSIS
+#
+# This extracts a price-like series from the chart area.
+# Because Pocket Option does not provide a public OTC market
+# API, this is deliberately treated as screen analysis.
+# ============================================================
 
-    # -----------------------------------------
-    # Method 2: raw image POST
-    # -----------------------------------------
+def extract_chart_signal(frame):
+    if frame is None:
+        return None
 
-    elif request.data:
+    h, w = frame.shape[:2]
 
-        image_data = request.data
+    # Ignore most of the dashboard UI.
+    # Focus on the central/right chart area.
+    x1 = int(w * 0.20)
+    x2 = int(w * 0.92)
+    y1 = int(h * 0.15)
+    y2 = int(h * 0.85)
 
-    # -----------------------------------------
-    # Method 3: JSON base64 image
-    # -----------------------------------------
+    roi = frame[y1:y2, x1:x2]
 
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # Light chart/grid/candle structures produce intensity changes.
+    # Create a vertical activity profile.
+    profile = np.mean(gray, axis=0)
+
+    if len(profile) < 30:
+        return None
+
+    # Smooth profile.
+    kernel_size = 9
+    kernel = np.ones(kernel_size) / kernel_size
+    smooth = np.convolve(profile, kernel, mode="same")
+
+    # Convert chart activity into a normalized pseudo-price series.
+    # This is not a broker price feed; it is a visual measurement.
+    normalized = (smooth - np.min(smooth))
+
+    max_value = np.max(normalized)
+
+    if max_value <= 0:
+        return None
+
+    normalized = normalized / max_value
+
+    # Reverse so upward chart movement behaves like rising price.
+    pseudo_price = normalized * 100.0
+
+    # Remove extreme edges.
+    pseudo_price = pseudo_price[10:-10]
+
+    if len(pseudo_price) < 30:
+        return None
+
+    # Sample into approximately 100 observations.
+    target = 100
+    indices = np.linspace(
+        0,
+        len(pseudo_price) - 1,
+        min(target, len(pseudo_price)),
+        dtype=int
+    )
+
+    prices = pseudo_price[indices]
+
+    return prices.astype(float)
+
+
+def generate_signal(prices):
+    if prices is None or len(prices) < 30:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "trend": "UNKNOWN",
+            "rsi": 50,
+            "ema_fast": 0,
+            "ema_slow": 0,
+            "message": "Not enough chart data."
+        }
+
+    fast = ema(prices, 9)
+    slow = ema(prices, 21)
+    rsi = calculate_rsi(prices, 14)
+
+    if fast is None or slow is None:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "trend": "UNKNOWN",
+            "rsi": round(rsi, 1),
+            "ema_fast": 0,
+            "ema_slow": 0,
+            "message": "Calculating indicators..."
+        }
+
+    recent_change = prices[-1] - prices[-10]
+    ema_difference = fast - slow
+
+    score = 0
+
+    # Trend
+    if ema_difference > 0:
+        score += 25
+        trend = "BULLISH"
     else:
+        score -= 25
+        trend = "BEARISH"
+
+    # Recent momentum
+    if recent_change > 1.0:
+        score += 20
+    elif recent_change < -1.0:
+        score -= 20
+
+    # RSI confirmation
+    if 50 <= rsi <= 70:
+        score += 15
+    elif 30 <= rsi < 50:
+        score -= 5
+    elif rsi > 75:
+        score -= 15
+    elif rsi < 25:
+        score += 15
+
+    # Convert score to confidence.
+    confidence = min(95, max(50, 50 + abs(score)))
+
+    if score >= 45 and confidence >= MIN_CONFIDENCE:
+        signal = "CALL"
+        message = "Bullish screen structure detected."
+    elif score <= -45 and confidence >= MIN_CONFIDENCE:
+        signal = "PUT"
+        message = "Bearish screen structure detected."
+    else:
+        signal = "WAIT"
+        confidence = min(confidence, 69)
+        message = "Conditions are not strong enough."
+
+    return {
+        "signal": signal,
+        "confidence": int(confidence),
+        "trend": trend,
+        "rsi": round(rsi, 1),
+        "ema_fast": round(fast, 4),
+        "ema_slow": round(slow, 4),
+        "message": message
+    }
+
+
+# ============================================================
+# FEED WORKER
+# ============================================================
+
+def feed_worker():
+    global state
+
+    while True:
+        if not FEED_URL:
+            with lock:
+                state["connected"] = False
+                state["feed"] = "NOT CONFIGURED"
+                state["signal"] = "WAIT"
+                state["confidence"] = 0
+                state["message"] = (
+                    "Add RTSP_FEED_URL in Render environment variables."
+                )
+
+            time.sleep(3)
+            continue
+
+        capture = None
 
         try:
+            capture = cv2.VideoCapture(FEED_URL)
 
-            body = request.get_json(silent=True) or {}
+            if not capture.isOpened():
+                with lock:
+                    state["connected"] = False
+                    state["feed"] = "OFFLINE"
+                    state["message"] = "Unable to open RTSP feed."
 
-            encoded = body.get("image", "")
+                time.sleep(5)
+                continue
 
-            if encoded:
+            with lock:
+                state["connected"] = True
+                state["feed"] = "LIVE"
+                state["message"] = "Screen feed connected."
 
-                if encoded.startswith("data:") and "," in encoded:
-                    encoded = encoded.split(",", 1)[1]
+            while True:
+                ok, frame = capture.read()
 
-                image_data = base64.b64decode(encoded)
+                if not ok or frame is None:
+                    with lock:
+                        state["connected"] = False
+                        state["feed"] = "DISCONNECTED"
+                        state["message"] = "Screen feed stopped."
 
-        except Exception:
+                    break
 
-            image_data = None
+                prices = extract_chart_signal(frame)
+                result = generate_signal(prices)
 
-    if not image_data:
+                with lock:
+                    state["connected"] = True
+                    state["feed"] = "LIVE"
+                    state["signal"] = result["signal"]
+                    state["confidence"] = result["confidence"]
+                    state["trend"] = result["trend"]
+                    state["rsi"] = result["rsi"]
+                    state["ema_fast"] = result["ema_fast"]
+                    state["ema_slow"] = result["ema_slow"]
+                    state["candle_count"] = len(prices) if prices is not None else 0
+                    state["price"] = (
+                        round(float(prices[-1]), 3)
+                        if prices is not None and len(prices)
+                        else 0
+                    )
+                    state["scan"] += 1
+                    state["last_update"] = datetime.now(
+                        timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    state["message"] = result["message"]
 
-        return jsonify({
-            "ok": False,
-            "error": "No image received"
-        }), 400
+                time.sleep(ANALYSIS_SECONDS)
 
-    # Maximum frame size: 8 MB
-    if len(image_data) > 8 * 1024 * 1024:
+        except Exception as exc:
+            with lock:
+                state["connected"] = False
+                state["feed"] = "ERROR"
+                state["message"] = str(exc)[:180]
 
-        return jsonify({
-            "ok": False,
-            "error": "Image exceeds 8 MB limit"
-        }), 413
+            time.sleep(5)
 
-    store_frame(image_data)
+        finally:
+            if capture is not None:
+                capture.release()
 
+
+# ============================================================
+# API
+# ============================================================
+
+@app.route("/api/status")
+def api_status():
+    with lock:
+        return jsonify(dict(state))
+
+
+@app.route("/health")
+def health():
     return jsonify({
-        "ok": True,
-        "service": "ALUCARD V2",
-        "received_at": latest_received,
-        "bytes": latest_size
+        "status": "ok",
+        "app": APP_NAME,
+        "feed_configured": bool(FEED_URL)
     })
 
 
-# =========================================================
-# SCREEN FEED STATUS
-# =========================================================
+# ============================================================
+# DASHBOARD
+# ============================================================
 
-@app.get("/api/screen/status")
-def screen_status():
-
-    if latest_received is None:
-
-        return jsonify({
-            "screen_feed": "OFFLINE",
-            "last_frame": None,
-            "age_seconds": None
-        })
-
-    try:
-
-        received = datetime.fromisoformat(latest_received)
-
-        age = (
-            now_utc() - received
-        ).total_seconds()
-
-    except Exception:
-
-        age = None
-
-    live = (
-        age is not None
-        and age <= 15
-    )
-
-    return jsonify({
-        "screen_feed": "LIVE" if live else "OFFLINE",
-        "last_frame": latest_received,
-        "age_seconds": round(age, 2) if age is not None else None,
-        "frame_bytes": latest_size
-    })
-
-
-# =========================================================
-# SHOW MOST RECENT SCREEN
-# =========================================================
-
-@app.get("/api/screen/latest")
-def latest_screen():
-
-    if latest_frame is None:
-
-        return jsonify({
-            "ok": False,
-            "error": "No Android screen frame received yet"
-        }), 404
-
-    return Response(
-        latest_frame,
-        mimetype="image/jpeg",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate"
-        }
-    )
-
-
-# =========================================================
-# ALUCARD DASHBOARD
-# =========================================================
-
-HTML = """
+HTML = r"""
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<title>ALUCARD V2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ALUCARD SIGNAL BOT</title>
 
 <style>
+* {
+    box-sizing: border-box;
+}
 
 body {
     margin: 0;
-    background: #070707;
-    color: white;
-    font-family: Arial, sans-serif;
+    background:
+        radial-gradient(circle at top, #250000 0%, #090909 45%, #000 100%);
+    color: #eee;
+    font-family: Arial, Helvetica, sans-serif;
 }
 
 .header {
+    padding: 18px;
     text-align: center;
-    padding: 22px 10px;
-    border-bottom: 1px solid #333;
+    border-bottom: 1px solid #4a0000;
+    background: rgba(0,0,0,.75);
 }
 
-.title {
-    font-size: 30px;
-    font-weight: bold;
-    letter-spacing: 4px;
+.logo {
+    font-size: 25px;
+    font-weight: 900;
+    letter-spacing: 3px;
 }
 
 .subtitle {
-    color: #999;
-    margin-top: 7px;
+    margin-top: 5px;
+    font-size: 11px;
     letter-spacing: 2px;
+    color: #aaa;
 }
 
-.card {
+.container {
     max-width: 1100px;
-    margin: 20px auto;
-    padding: 20px;
+    margin: auto;
+    padding: 15px;
+}
+
+.status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     background: #111;
     border: 1px solid #333;
-    border-radius: 14px;
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 15px;
 }
 
-.feed-status {
-    font-size: 22px;
-    font-weight: bold;
+.dot {
+    width: 12px;
+    height: 12px;
+    display: inline-block;
+    border-radius: 50%;
+    margin-right: 7px;
+    background: #555;
 }
 
 .live {
-    color: #4cff88;
+    background: #00d26a;
+    box-shadow: 0 0 12px #00d26a;
 }
 
 .offline {
-    color: #ff5555;
+    background: #d00000;
 }
 
-.waiting {
-    color: #ffaa33;
-}
-
-.info {
-    margin-top: 10px;
-    color: #999;
-    font-size: 14px;
-}
-
-.screen-container {
-    margin-top: 20px;
-    background: black;
-    border-radius: 10px;
-    overflow: hidden;
+.signal {
     text-align: center;
+    border-radius: 18px;
+    padding: 25px 10px;
+    background: #0d0d0d;
+    border: 1px solid #3c0000;
+    margin-bottom: 15px;
 }
 
-.screen {
-    width: 100%;
-    max-height: 700px;
-    object-fit: contain;
+.signal-name {
+    font-size: 58px;
+    font-weight: 900;
+    letter-spacing: 4px;
 }
 
-.hidden {
-    display: none;
+.call {
+    color: #35ff8a;
+    text-shadow: 0 0 18px rgba(53,255,138,.35);
 }
 
+.put {
+    color: #ff4545;
+    text-shadow: 0 0 18px rgba(255,69,69,.35);
+}
+
+.wait {
+    color: #ffd84a;
+}
+
+.confidence {
+    font-size: 18px;
+    margin-top: 5px;
+}
+
+.message {
+    color: #aaa;
+    margin-top: 12px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+}
+
+.card {
+    background: #111;
+    border: 1px solid #292929;
+    border-radius: 12px;
+    padding: 16px;
+}
+
+.label {
+    color: #888;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.value {
+    font-size: 23px;
+    font-weight: bold;
+    margin-top: 7px;
+}
+
+.footer {
+    text-align: center;
+    color: #666;
+    font-size: 11px;
+    padding: 25px;
+}
+
+.warning {
+    margin-top: 15px;
+    padding: 12px;
+    border-radius: 10px;
+    background: #1b1200;
+    border: 1px solid #554000;
+    color: #e4c96b;
+    font-size: 12px;
+}
+
+@media(max-width:650px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .signal-name {
+        font-size: 48px;
+    }
+}
 </style>
-
 </head>
 
 <body>
 
 <div class="header">
+    <div class="logo">ALUCARD SIGNAL BOT</div>
+    <div class="subtitle">GOTHIC MARKET INTELLIGENCE</div>
+</div>
 
-    <div class="title">
-        ALUCARD V2
+<div class="container">
+
+    <div class="status">
+        <div>
+            <span id="dot" class="dot"></span>
+            <span id="feed">CONNECTING...</span>
+        </div>
+        <div>
+            SCAN #<span id="scan">0</span>
+        </div>
     </div>
 
-    <div class="subtitle">
-        GOTHIC MARKET INTELLIGENCE
+    <div class="signal">
+        <div id="signal" class="signal-name wait">WAIT</div>
+        <div class="confidence">
+            Confidence: <span id="confidence">0</span>%
+        </div>
+        <div class="message" id="message">
+            Waiting for screen feed...
+        </div>
+    </div>
+
+    <div class="grid">
+
+        <div class="card">
+            <div class="label">Trend</div>
+            <div class="value" id="trend">UNKNOWN</div>
+        </div>
+
+        <div class="card">
+            <div class="label">RSI</div>
+            <div class="value" id="rsi">50</div>
+        </div>
+
+        <div class="card">
+            <div class="label">EMA 9</div>
+            <div class="value" id="emaFast">0</div>
+        </div>
+
+        <div class="card">
+            <div class="label">EMA 21</div>
+            <div class="value" id="emaSlow">0</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Visual Price</div>
+            <div class="value" id="price">0</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Chart Samples</div>
+            <div class="value" id="candles">0</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Last Update</div>
+            <div class="value" id="updated">Never</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Feed</div>
+            <div class="value" id="feed2">OFFLINE</div>
+        </div>
+
+    </div>
+
+    <div class="warning">
+        Screen-analysis mode: signals are generated from the visible chart feed.
+        They are informational and do not place trades automatically.
     </div>
 
 </div>
 
-
-<div class="card">
-
-    <div class="feed-status">
-
-        ANDROID SCREEN:
-        <span id="status"
-              class="waiting">
-            CONNECTING...
-        </span>
-
-    </div>
-
-    <div id="info"
-         class="info">
-        Checking screen feed...
-    </div>
-
-
-    <div class="screen-container">
-
-        <img id="screen"
-             class="screen hidden">
-
-    </div>
-
+<div class="footer">
+    ALUCARD • SCREEN ANALYSIS ENGINE
 </div>
-
 
 <script>
-
-async function updateScreen() {
-
+async function update() {
     try {
+        const response = await fetch("/api/status");
+        const s = await response.json();
 
-        const response =
-            await fetch(
-                "/api/screen/status?t=" +
-                Date.now()
-            );
+        document.getElementById("feed").textContent = s.feed;
+        document.getElementById("feed2").textContent = s.feed;
+        document.getElementById("scan").textContent = s.scan;
 
-        const data =
-            await response.json();
+        const dot = document.getElementById("dot");
 
-        const status =
-            document.getElementById("status");
+        dot.className = "dot " + (
+            s.connected ? "live" : "offline"
+        );
 
-        const info =
-            document.getElementById("info");
+        const signal = document.getElementById("signal");
 
-        const image =
-            document.getElementById("screen");
+        signal.textContent = s.signal;
+        signal.className = "signal-name " +
+            (s.signal === "CALL" ? "call" :
+             s.signal === "PUT" ? "put" : "wait");
 
+        document.getElementById("confidence").textContent = s.confidence;
+        document.getElementById("trend").textContent = s.trend;
+        document.getElementById("rsi").textContent = s.rsi;
+        document.getElementById("emaFast").textContent = s.ema_fast;
+        document.getElementById("emaSlow").textContent = s.ema_slow;
+        document.getElementById("price").textContent = s.price;
+        document.getElementById("candles").textContent = s.candle_count;
+        document.getElementById("updated").textContent = s.last_update;
+        document.getElementById("message").textContent = s.message;
 
-        if (data.screen_feed === "LIVE") {
-
-            status.textContent = "LIVE";
-            status.className = "live";
-
-            info.textContent =
-                "Android screen received " +
-                data.age_seconds +
-                " seconds ago.";
-
-
-            image.classList.remove("hidden");
-
-            image.src =
-                "/api/screen/latest?t=" +
-                Date.now();
-
-        }
-
-        else {
-
-            status.textContent = "OFFLINE";
-            status.className = "offline";
-
-            info.textContent =
-                "Waiting for Android screen capture...";
-
-            image.classList.add("hidden");
-
-        }
-
+    } catch (e) {
+        document.getElementById("feed").textContent = "SERVER ERROR";
+        document.getElementById("dot").className = "dot offline";
     }
-
-    catch (error) {
-
-        const status =
-            document.getElementById("status");
-
-        const info =
-            document.getElementById("info");
-
-        status.textContent = "OFFLINE";
-        status.className = "offline";
-
-        info.textContent =
-            "Unable to contact Alucard server.";
-
-    }
-
 }
 
-
-updateScreen();
-
-setInterval(
-    updateScreen,
-    3000
-);
-
+update();
+setInterval(update, 2000);
 </script>
 
 </body>
-
 </html>
 """
 
 
-@app.get("/")
+@app.route("/")
 def dashboard():
-
     return render_template_string(HTML)
 
 
-# =========================================================
-# START SERVER
-# =========================================================
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
+    thread = threading.Thread(target=feed_worker, daemon=True)
+    thread.start()
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     app.run(
         host="0.0.0.0",
