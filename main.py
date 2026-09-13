@@ -3,464 +3,431 @@ import time
 import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, request, render_template_string
 
 app = Flask(__name__)
 
-# ============================================================
+# ------------------------------------------------------------
 # ALUCARD SIGNAL BOT
 # Screen-stream receiver / signal dashboard
-# ============================================================
+# ------------------------------------------------------------
 
 RTSP_FEED_URL = os.getenv("RTSP_FEED_URL", "").strip()
 FEED_TOKEN = os.getenv("FEED_TOKEN", "").strip()
 
-DEFAULT_ASSET = os.getenv("DEFAULT_ASSET", "EUR/USD OTC")
-EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "300"))
-
 state = {
     "connected": False,
-    "feed_url": RTSP_FEED_URL,
-    "last_frame": None,
     "last_update": None,
-    "asset": DEFAULT_ASSET,
-    "direction": "WAIT",
+    "frame_count": 0,
+    "asset": "EUR/USD OTC",
+    "signal": "WAIT",
     "confidence": 0,
     "entry_price": "--",
-    "expiry": EXPIRY_SECONDS,
-    "message": "Waiting for Android screen stream",
-    "scan_count": 0,
-    "feed_status": "WAITING",
+    "payout": "--",
+    "timeframe": "5m",
+    "message": "Waiting for screen feed...",
 }
 
 
-# ============================================================
-# BACKGROUND FEED MONITOR
-# ============================================================
-
-def feed_monitor():
-    while True:
-        try:
-            state["scan_count"] += 1
-
-            if RTSP_FEED_URL:
-                state["feed_status"] = "RTSP CONFIGURED"
-                state["message"] = "Waiting for screen-stream frames"
-            else:
-                state["feed_status"] = "NO RTSP URL"
-                state["message"] = "Set RTSP_FEED_URL in Render Environment"
-
-        except Exception as exc:
-            state["feed_status"] = "ERROR"
-            state["message"] = str(exc)
-
-        time.sleep(5)
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-threading.Thread(target=feed_monitor, daemon=True).start()
+def feed_is_fresh():
+    last = state.get("last_update")
+    if not last:
+        return False
+
+    try:
+        old = datetime.strptime(last, "%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return (now - old).total_seconds() < 15
+    except Exception:
+        return False
 
 
-# ============================================================
-# MAIN DASHBOARD
-# ============================================================
-
-HTML = """
+@app.route("/")
+def home():
+    html = """
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ALUCARD SIGNAL BOT</title>
 
-    <title>ALUCARD SIGNAL BOT</title>
+<style>
+* {
+    box-sizing: border-box;
+}
 
-    <style>
-        * {
-            box-sizing: border-box;
-        }
+body {
+    margin: 0;
+    background: #07070b;
+    color: #eee;
+    font-family: Arial, sans-serif;
+}
 
-        body {
-            margin: 0;
-            background:
-                radial-gradient(circle at top, #260000 0%, #090909 45%, #000000 100%);
-            color: white;
-            font-family: Arial, Helvetica, sans-serif;
-            min-height: 100vh;
-        }
+.header {
+    padding: 18px;
+    text-align: center;
+    border-bottom: 1px solid #292934;
+    background: #0c0c12;
+}
 
-        .header {
-            padding: 18px;
-            text-align: center;
-            border-bottom: 1px solid #4d1111;
-            background: rgba(0,0,0,.65);
-        }
+.logo {
+    font-size: 25px;
+    font-weight: 900;
+    letter-spacing: 3px;
+}
 
-        .title {
-            font-size: 30px;
-            font-weight: 900;
-            letter-spacing: 3px;
-            color: #ff3030;
-            text-shadow: 0 0 15px #ff0000;
-        }
+.sub {
+    margin-top: 5px;
+    color: #999;
+    font-size: 11px;
+    letter-spacing: 2px;
+}
 
-        .subtitle {
-            margin-top: 5px;
-            color: #aaa;
-            font-size: 12px;
-            letter-spacing: 2px;
-        }
+.status {
+    margin: 15px;
+    padding: 12px;
+    border: 1px solid #292934;
+    border-radius: 10px;
+    background: #101017;
+    text-align: center;
+}
 
-        .container {
-            width: 94%;
-            max-width: 1200px;
-            margin: 18px auto;
-        }
+.dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #777;
+    margin-right: 7px;
+}
 
-        .status {
-            display: flex;
-            justify-content: space-between;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-bottom: 15px;
-        }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    padding: 15px;
+}
 
-        .status-card {
-            flex: 1;
-            min-width: 150px;
-            padding: 14px;
-            background: rgba(20,20,20,.9);
-            border: 1px solid #441010;
-            border-radius: 10px;
-        }
+.card {
+    background: #111118;
+    border: 1px solid #292934;
+    border-radius: 12px;
+    padding: 16px;
+}
 
-        .label {
-            font-size: 11px;
-            color: #888;
-            text-transform: uppercase;
-        }
+.label {
+    color: #888;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
 
-        .value {
-            margin-top: 6px;
-            font-size: 18px;
-            font-weight: bold;
-        }
+.value {
+    margin-top: 8px;
+    font-size: 22px;
+    font-weight: bold;
+}
 
-        .green {
-            color: #39ff88;
-        }
+.signal {
+    grid-column: span 2;
+    text-align: center;
+    padding: 25px;
+}
 
-        .red {
-            color: #ff4040;
-        }
+.signalValue {
+    font-size: 42px;
+    font-weight: 900;
+    margin-top: 8px;
+}
 
-        .yellow {
-            color: #ffd84d;
-        }
+.wait {
+    color: #aaa;
+}
 
-        .panel {
-            background: rgba(10,10,10,.92);
-            border: 1px solid #441010;
-            border-radius: 14px;
-            overflow: hidden;
-            margin-bottom: 15px;
-            box-shadow: 0 0 25px rgba(120,0,0,.15);
-        }
+.call {
+    color: #36e58a;
+}
 
-        .panel-title {
-            padding: 13px 16px;
-            background: #160606;
-            border-bottom: 1px solid #441010;
-            font-weight: bold;
-            letter-spacing: 1px;
-        }
+.put {
+    color: #ff5577;
+}
 
-        .screen {
-            height: 400px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            background:
-                linear-gradient(135deg,#071b0b,#001006,#061b0a);
-            color: #777;
-            padding: 20px;
-        }
+.info {
+    padding: 15px;
+}
 
-        .screen-inner {
-            max-width: 600px;
-        }
+.infoBox {
+    background: #101017;
+    border: 1px solid #292934;
+    border-radius: 12px;
+    padding: 15px;
+}
 
-        .screen-icon {
-            font-size: 60px;
-            margin-bottom: 15px;
-        }
+.small {
+    color: #888;
+    font-size: 12px;
+    line-height: 1.6;
+}
 
-        .signal {
-            text-align: center;
-            padding: 25px;
-        }
-
-        .asset {
-            font-size: 24px;
-            font-weight: bold;
-        }
-
-        .direction {
-            font-size: 65px;
-            font-weight: 900;
-            margin: 10px 0;
-            text-shadow: 0 0 20px currentColor;
-        }
-
-        .confidence {
-            font-size: 20px;
-            color: #ddd;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit,minmax(160px,1fr));
-            gap: 10px;
-            padding: 15px;
-        }
-
-        .indicator {
-            padding: 15px;
-            background: #111;
-            border: 1px solid #2d2d2d;
-            border-radius: 8px;
-        }
-
-        .indicator strong {
-            display: block;
-            margin-top: 5px;
-            font-size: 18px;
-        }
-
-        .footer {
-            text-align: center;
-            color: #666;
-            font-size: 11px;
-            padding: 20px;
-        }
-
-        @media(max-width:600px) {
-            .title {
-                font-size: 23px;
-            }
-
-            .screen {
-                height: 300px;
-            }
-
-            .direction {
-                font-size: 48px;
-            }
-        }
-    </style>
+@media(max-width:600px) {
+    .grid {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+</style>
 </head>
 
 <body>
 
 <div class="header">
-    <div class="title">ALUCARD SIGNAL BOT</div>
-    <div class="subtitle">GOTHIC MARKET INTELLIGENCE</div>
+    <div class="logo">ALUCARD SIGNAL BOT</div>
+    <div class="sub">GOTHIC MARKET INTELLIGENCE</div>
 </div>
 
-<div class="container">
+<div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="connection">CHECKING FEED...</span>
+</div>
 
-    <div class="status">
+<div class="grid">
 
-        <div class="status-card">
-            <div class="label">Feed</div>
-            <div id="feedStatus" class="value yellow">WAITING</div>
-        </div>
-
-        <div class="status-card">
-            <div class="label">Scan</div>
-            <div id="scan" class="value">0</div>
-        </div>
-
-        <div class="status-card">
-            <div class="label">Asset</div>
-            <div id="assetTop" class="value">EUR/USD OTC</div>
-        </div>
-
-        <div class="status-card">
-            <div class="label">System</div>
-            <div id="systemStatus" class="value green">ONLINE</div>
-        </div>
-
+    <div class="card">
+        <div class="label">Asset</div>
+        <div class="value" id="asset">--</div>
     </div>
 
-
-    <div class="panel">
-
-        <div class="panel-title">
-            ANDROID SCREEN STREAM
-        </div>
-
-        <div class="screen">
-
-            <div class="screen-inner">
-
-                <div class="screen-icon">🩸</div>
-
-                <div id="streamMessage">
-                    Waiting for Android Pocket Option screen stream
-                </div>
-
-                <div style="margin-top:10px;font-size:11px;color:#555;">
-                    RTSP FEED
-                </div>
-
-                <div id="rtsp"
-                     style="margin-top:5px;font-size:12px;color:#777;">
-                    Not configured
-                </div>
-
-            </div>
-
-        </div>
-
+    <div class="card">
+        <div class="label">Timeframe</div>
+        <div class="value" id="timeframe">--</div>
     </div>
 
-
-    <div class="panel">
-
-        <div class="panel-title">
-            CURRENT SIGNAL
-        </div>
-
-        <div class="signal">
-
-            <div id="asset" class="asset">
-                EUR/USD OTC
-            </div>
-
-            <div id="direction"
-                 class="direction yellow">
-                WAIT
-            </div>
-
-            <div id="confidence"
-                 class="confidence">
-                Confidence: 0%
-            </div>
-
-            <div style="margin-top:15px;color:#888;">
-                Entry Price:
-                <span id="entryPrice">--</span>
-            </div>
-
-            <div style="margin-top:8px;color:#888;">
-                Expiry:
-                <span id="expiry">5 minutes</span>
-            </div>
-
-        </div>
-
+    <div class="card signal">
+        <div class="label">Current Signal</div>
+        <div class="signalValue wait" id="signal">WAIT</div>
+        <div class="small" id="confidence">Confidence: 0%</div>
     </div>
 
+    <div class="card">
+        <div class="label">Entry Price</div>
+        <div class="value" id="entry">--</div>
+    </div>
 
-    <div class="panel">
-
-        <div class="panel-title">
-            MARKET ENGINE
-        </div>
-
-        <div class="grid">
-
-            <div class="indicator">
-                EMA
-                <strong id="ema">WAIT</strong>
-            </div>
-
-            <div class="indicator">
-                RSI
-                <strong id="rsi">WAIT</strong>
-            </div>
-
-            <div class="indicator">
-                STOCHASTIC
-                <strong id="stoch">WAIT</strong>
-            </div>
-
-            <div class="indicator">
-                MACD
-                <strong id="macd">WAIT</strong>
-            </div>
-
-            <div class="indicator">
-                ALLIGATOR
-                <strong id="alligator">WAIT</strong>
-            </div>
-
-            <div class="indicator">
-                DATA
-                <strong id="dataState">WAITING</strong>
-            </div>
-
-        </div>
-
+    <div class="card">
+        <div class="label">Payout</div>
+        <div class="value" id="payout">--</div>
     </div>
 
 </div>
 
-
-<div class="footer">
-    ALUCARD SIGNAL BOT • SCREEN ANALYSIS MODE • DEMO / INFORMATIONAL USE
+<div class="info">
+    <div class="infoBox">
+        <div class="label">Feed Information</div>
+        <div class="small">
+            Last update: <span id="last">--</span><br>
+            Frames received: <span id="frames">0</span><br>
+            Feed URL configured: <span id="feed">NO</span>
+        </div>
+    </div>
 </div>
-
 
 <script>
-
 async function updateDashboard() {
-
     try {
-
-        const response = await fetch("/api/status");
-
-        if (!response.ok) {
-            throw new Error("Status request failed");
-        }
+        const response = await fetch("/api/status", {
+            cache: "no-store"
+        });
 
         const data = await response.json();
 
-        document.getElementById("feedStatus").textContent =
-            data.feed_status;
-
-        document.getElementById("scan").textContent =
-            data.scan_count;
-
         document.getElementById("asset").textContent =
-            data.asset;
+            data.asset || "--";
 
-        document.getElementById("assetTop").textContent =
-            data.asset;
+        document.getElementById("timeframe").textContent =
+            data.timeframe || "--";
 
-        document.getElementById("streamMessage").textContent =
-            data.message;
+        const signal = document.getElementById("signal");
 
-        document.getElementById("rtsp").textContent =
-            data.feed_url || "Not configured";
+        signal.textContent = data.signal || "WAIT";
 
-        document.getElementById("direction").textContent =
-            data.direction;
+        signal.className = "signalValue";
+
+        if (data.signal === "CALL") {
+            signal.classList.add("call");
+        } else if (data.signal === "PUT") {
+            signal.classList.add("put");
+        } else {
+            signal.classList.add("wait");
+        }
 
         document.getElementById("confidence").textContent =
-            "Confidence: " + data.confidence + "%";
+            "Confidence: " + (data.confidence || 0) + "%";
 
-        document.getElementById("entryPrice").textContent =
-            data.entry_price;
+        document.getElementById("entry").textContent =
+            data.entry_price || "--";
 
-        document.getElementById("expiry").textContent =
-            formatExpiry(data.expiry);
+        document.getElementById("payout").textContent =
+            data.payout || "--";
 
-        document.getElementById("dataState").textContent =
-            data.feed_status;
+        document.getElementById("last").textContent =
+            data.last_update || "--";
+
+        document.getElementById("frames").textContent =
+            data.frame_count || 0;
+
+        document.getElementById("feed").textContent =
+            data.feed_configured ? "YES" : "NO";
+
+        const connection =
+            document.getElementById("connection");
+
+        const dot =
+            document.getElementById("dot");
+
+        if (data.connected) {
+            connection.textContent = "LIVE SCREEN FEED";
+            dot.style.background = "#36e58a";
+        } else {
+            connection.textContent = "WAITING FOR SCREEN FEED";
+            dot.style.background = "#777";
+        }
 
     } catch (error) {
+        document.getElementById("connection").textContent =
+            "DASHBOARD CONNECTION ERROR";
 
-        document.getElementById("systemStatus").textContent =
-           
+        document.getElementById("dot").style.background =
+            "#ff5577";
+    }
+}
+
+updateDashboard();
+setInterval(updateDashboard, 2000);
+</script>
+
+</body>
+</html>
+"""
+
+    return render_template_string(html)
+
+
+@app.route("/api/status")
+def api_status():
+    connected = feed_is_fresh()
+    state["connected"] = connected
+
+    return jsonify({
+        "connected": connected,
+        "last_update": state["last_update"],
+        "frame_count": state["frame_count"],
+        "asset": state["asset"],
+        "signal": state["signal"],
+        "confidence": state["confidence"],
+        "entry_price": state["entry_price"],
+        "payout": state["payout"],
+        "timeframe": state["timeframe"],
+        "feed_configured": bool(RTSP_FEED_URL),
+        "server_time": utc_now()
+    })
+
+
+@app.route("/api/feed", methods=["POST"])
+def receive_feed():
+    # Optional token protection
+    if FEED_TOKEN:
+        supplied = request.headers.get("X-Feed-Token", "")
+
+        if supplied != FEED_TOKEN:
+            return jsonify({
+                "ok": False,
+                "error": "Invalid feed token"
+            }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    state["frame_count"] += 1
+    state["last_update"] = utc_now()
+
+    if "asset" in data:
+        state["asset"] = str(data["asset"])
+
+    if "signal" in data:
+        signal = str(data["signal"]).upper()
+
+        if signal in ("CALL", "PUT", "WAIT"):
+            state["signal"] = signal
+
+    if "confidence" in data:
+        try:
+            value = float(data["confidence"])
+            state["confidence"] = max(0, min(100, round(value)))
+        except Exception:
+            pass
+
+    if "entry_price" in data:
+        state["entry_price"] = str(data["entry_price"])
+
+    if "payout" in data:
+        state["payout"] = str(data["payout"])
+
+    if "timeframe" in data:
+        state["timeframe"] = str(data["timeframe"])
+
+    return jsonify({
+        "ok": True,
+        "message": "Feed received",
+        "frame_count": state["frame_count"],
+        "timestamp": state["last_update"]
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "Alucard Signal Bot",
+        "time": utc_now()
+    })
+
+
+@app.route("/api/test")
+def api_test():
+    state["frame_count"] += 1
+    state["last_update"] = utc_now()
+
+    return jsonify({
+        "ok": True,
+        "message": "Test feed received",
+        "frame_count": state["frame_count"],
+        "timestamp": state["last_update"]
+    })
+
+
+def background_monitor():
+    while True:
+        time.sleep(5)
+
+        if state["last_update"]:
+            state["connected"] = feed_is_fresh()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+
+    monitor = threading.Thread(
+        target=background_monitor,
+        daemon=True
+    )
+
+    monitor.start()
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
