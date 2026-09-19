@@ -1,946 +1,1079 @@
 import os
 import time
 import threading
-from flask import Flask, request, jsonify, render_template_string, Response
+from datetime import datetime, timezone
+
+import cv2
+import numpy as np
+import requests
+from flask import Flask, jsonify, render_template_string, request
+
+
+# ============================================================
+# ALUCARD V2 — SCREEN ANALYSIS ENGINE
+# ============================================================
 
 app = Flask(__name__)
 
-VERSION = "ALUCARD-2.3"
-FEED_TIMEOUT = int(os.getenv("FRAME_TIMEOUT", "15"))
-FEED_TOKEN = os.getenv("FEED_TOKEN", "")
+VERSION = "ALUCARD-V2.0"
 
-ASSETS = {
-    "FOREX": [
-        "EUR/USD",
-        "GBP/USD",
-        "USD/JPY",
-        "USD/CHF",
-        "AUD/USD",
-        "USD/CAD",
-        "NZD/USD",
-        "EUR/GBP",
-        "EUR/JPY",
-        "EUR/CHF",
-        "EUR/AUD",
-        "EUR/CAD",
-        "EUR/NZD",
-        "GBP/JPY",
-        "GBP/CHF",
-        "GBP/AUD",
-        "GBP/CAD",
-        "GBP/NZD",
-        "AUD/JPY",
-        "AUD/CAD",
-        "AUD/CHF",
-        "AUD/NZD",
-        "CAD/JPY",
-        "CAD/CHF",
-        "CHF/JPY",
-        "NZD/JPY",
-        "NZD/CAD",
-        "NZD/CHF"
-    ],
+# ------------------------------------------------------------
+# SETTINGS
+# ------------------------------------------------------------
 
-    "OTC FOREX": [
-        "EUR/USD OTC",
-        "GBP/USD OTC",
-        "USD/JPY OTC",
-        "USD/CHF OTC",
-        "AUD/USD OTC",
-        "USD/CAD OTC",
-        "NZD/USD OTC",
-        "EUR/GBP OTC",
-        "EUR/JPY OTC",
-        "EUR/CHF OTC",
-        "EUR/AUD OTC",
-        "EUR/CAD OTC",
-        "GBP/JPY OTC",
-        "GBP/CHF OTC",
-        "GBP/AUD OTC",
-        "AUD/JPY OTC",
-        "AUD/CAD OTC",
-        "AUD/CHF OTC",
-        "CAD/JPY OTC",
-        "CHF/JPY OTC",
-        "NZD/JPY OTC"
-    ],
+FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "RyuFeed-9xK7pQ2mV8sL4zN6")
 
-    "CRYPTO": [
-        "BTC/USD",
-        "ETH/USD",
-        "LTC/USD",
-        "XRP/USD",
-        "BCH/USD",
-        "ADA/USD",
-        "DOGE/USD",
-        "SOL/USD",
-        "DOT/USD",
-        "BNB/USD",
-        "BTC/USDT",
-        "ETH/USDT"
-    ],
+MIN_CONFIDENCE = 78
+FRACTAL_PERIOD = 2
 
-    "COMMODITIES": [
-        "Gold",
-        "XAU/USD",
-        "Silver",
-        "XAG/USD",
-        "Oil",
-        "Brent Oil",
-        "WTI Oil",
-        "Natural Gas",
-        "Copper"
-    ],
+EMA_FAST = 9
+EMA_MID = 20
+EMA_SLOW = 50
 
-    "INDICES": [
-        "US30",
-        "US100",
-        "NASDAQ",
-        "S&P 500",
-        "SPX",
-        "GER30",
-        "DAX",
-        "UK100",
-        "FTSE 100",
-        "JP225",
-        "Nikkei 225",
-        "AUS200",
-        "FRA40",
-        "EU50"
-    ],
+RSI_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
-    "STOCKS": [
-        "Apple",
-        "Microsoft",
-        "Amazon",
-        "Alphabet",
-        "Meta",
-        "Tesla",
-        "NVIDIA",
-        "Netflix",
-        "Intel",
-        "AMD",
-        "Coca-Cola",
-        "McDonald's",
-        "Boeing",
-        "Disney",
-        "Nike"
-    ]
-}
+CCI_PERIOD = 20
+ATR_PERIOD = 14
 
-STATE = {
-    "asset": "EUR/USD OTC",
+ENTRY_WINDOW = 12
+EXPIRY_SECONDS = 300
+
+STALE_SECONDS = 20
+
+
+# ------------------------------------------------------------
+# GLOBAL STATE
+# ------------------------------------------------------------
+
+state = {
+    "asset": "UNKNOWN",
     "price": 0.0,
     "signal": "WAIT",
     "confidence": 0,
-    "entry": None,
-    "entry_window": 0,
-    "candles": 0,
-    "connected": False,
+    "entry": 0.0,
+    "entry_window": ENTRY_WINDOW,
+    "expiry": EXPIRY_SECONDS,
+
     "feed": "DISCONNECTED",
     "image_received": False,
-    "frame_count": 0,
+
+    "candles": 0,
+    "fractal_period": FRACTAL_PERIOD,
+
+    "rsi": 0.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
+    "cci": 0.0,
+    "atr": 0.0,
+
+    "ema9": 0.0,
+    "ema20": 0.0,
+    "ema50": 0.0,
+
     "last_update": 0,
-    "last_frame": 0,
-    "scan": 0,
-    "favorite_assets": [
-        "EUR/USD OTC",
-        "GBP/USD OTC",
-        "USD/JPY OTC",
-        "BTC/USD",
-        "Gold"
-    ]
+    "last_signal_time": None,
+    "analysis": "Waiting for screen feed...",
+
+    "server_time": None,
 }
 
-FRAME_DATA = None
-FRAME_CONTENT_TYPE = "image/jpeg"
-LOCK = threading.Lock()
+
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+
+def now():
+    return time.time()
 
 
-def authorized():
-    if not FEED_TOKEN:
-        return True
+def utc_string():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    for header in (
-        "X-FEED-TOKEN",
-        "X-ALUCARD-TOKEN",
-        "X-RYU-TOKEN"
-    ):
-        if request.headers.get(header, "") == FEED_TOKEN:
+
+def clamp(value, low=0, high=100):
+    return max(low, min(high, value))
+
+
+def authorized(req):
+    token = req.headers.get("X-RYU-TOKEN", "")
+    return token == FEED_TOKEN
+
+
+# ------------------------------------------------------------
+# TECHNICAL INDICATORS
+# ------------------------------------------------------------
+
+def ema(values, period):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < period:
+        return None
+
+    alpha = 2.0 / (period + 1.0)
+
+    result = values[0]
+
+    for value in values[1:]:
+        result = alpha * value + (1 - alpha) * result
+
+    return result
+
+
+def ema_series(values, period):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) == 0:
+        return np.array([])
+
+    alpha = 2.0 / (period + 1.0)
+
+    output = np.zeros(len(values))
+    output[0] = values[0]
+
+    for i in range(1, len(values)):
+        output[i] = alpha * values[i] + (1 - alpha) * output[i - 1]
+
+    return output
+
+
+def rsi(values, period=14):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < period + 1:
+        return 50.0
+
+    delta = np.diff(values)
+
+    gains = np.where(delta > 0, delta, 0)
+    losses = np.where(delta < 0, -delta, 0)
+
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+
+    for i in range(period, len(delta)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def macd(values):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < MACD_SLOW:
+        return 0.0, 0.0
+
+    fast = ema_series(values, MACD_FAST)
+    slow = ema_series(values, MACD_SLOW)
+
+    line = fast - slow
+
+    signal = ema(line, MACD_SIGNAL)
+
+    if signal is None:
+        signal = line[-1]
+
+    return float(line[-1]), float(signal)
+
+
+def cci(values, period=20):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < period:
+        return 0.0
+
+    window = values[-period:]
+
+    mean = np.mean(window)
+    deviation = np.mean(np.abs(window - mean))
+
+    if deviation == 0:
+        return 0.0
+
+    return float((window[-1] - mean) / (0.015 * deviation))
+
+
+def atr(values, period=14):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < period + 1:
+        return 0.0
+
+    differences = np.abs(np.diff(values))
+
+    return float(np.mean(differences[-period:]))
+
+
+# ------------------------------------------------------------
+# FRACTAL ANALYSIS
+# ------------------------------------------------------------
+
+def fractal_direction(values, period=2):
+    """
+    Fractal confirmation.
+
+    A bullish fractal is formed when the current low is lower
+    than surrounding lows.
+
+    A bearish fractal is formed when the current high is higher
+    than surrounding highs.
+
+    With period=2 this requires two candles on each side.
+    """
+
+    values = np.asarray(values, dtype=float)
+
+    needed = period * 2 + 1
+
+    if len(values) < needed:
+        return "NONE"
+
+    center = len(values) - period - 1
+
+    left = values[center - period:center]
+    right = values[center + 1:center + period + 1]
+
+    center_value = values[center]
+
+    if center_value < np.min(left) and center_value < np.min(right):
+        return "BULLISH"
+
+    if center_value > np.max(left) and center_value > np.max(right):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ------------------------------------------------------------
+# SCREEN / IMAGE PRICE EXTRACTION
+# ------------------------------------------------------------
+
+def decode_image(raw):
+    try:
+        array = np.frombuffer(raw, dtype=np.uint8)
+
+        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return None
+
+        return image
+
+    except Exception:
+        return None
+
+
+def estimate_price_from_image(image):
+    """
+    Screen-feed mode does not require an SSID.
+
+    This function intentionally provides a conservative result.
+    If the price cannot be reliably extracted, the engine does
+    not manufacture a price.
+    """
+
+    if image is None:
+        return None
+
+    return None
+
+
+# ------------------------------------------------------------
+# ANALYSIS ENGINE
+# ------------------------------------------------------------
+
+def analyze_prices(prices, asset="UNKNOWN"):
+    global state
+
+    prices = np.asarray(prices, dtype=float)
+
+    prices = prices[np.isfinite(prices)]
+
+    if len(prices) < 60:
+        state["signal"] = "WAIT"
+        state["confidence"] = 0
+        state["analysis"] = "Collecting candles..."
+        return
+
+    current = float(prices[-1])
+
+    ema9 = ema(prices, EMA_FAST)
+    ema20 = ema(prices, EMA_MID)
+    ema50 = ema(prices, EMA_SLOW)
+
+    rsi_value = rsi(prices, RSI_PERIOD)
+
+    macd_value, macd_signal_value = macd(prices)
+
+    cci_value = cci(prices, CCI_PERIOD)
+
+    atr_value = atr(prices, ATR_PERIOD)
+
+    fractal = fractal_direction(
+        prices,
+        FRACTAL_PERIOD
+    )
+
+    state["price"] = current
+
+    state["ema9"] = float(ema9 or 0)
+    state["ema20"] = float(ema20 or 0)
+    state["ema50"] = float(ema50 or 0)
+
+    state["rsi"] = float(rsi_value)
+    state["macd"] = float(macd_value)
+    state["macd_signal"] = float(macd_signal_value)
+
+    state["cci"] = float(cci_value)
+    state["atr"] = float(atr_value)
+
+    state["candles"] = len(prices)
+
+    # --------------------------------------------------------
+    # SCORING
+    # --------------------------------------------------------
+
+    call_score = 0
+    put_score = 0
+
+    reasons_call = []
+    reasons_put = []
+
+    # EMA structure
+    if ema9 > ema20 > ema50:
+        call_score += 20
+        reasons_call.append("EMA bullish")
+
+    elif ema9 < ema20 < ema50:
+        put_score += 20
+        reasons_put.append("EMA bearish")
+
+    # Price vs EMA
+    if current > ema9:
+        call_score += 8
+
+    elif current < ema9:
+        put_score += 8
+
+    # RSI
+    if 50 < rsi_value < 70:
+        call_score += 12
+        reasons_call.append("RSI bullish")
+
+    elif 30 < rsi_value < 50:
+        put_score += 12
+        reasons_put.append("RSI bearish")
+
+    # MACD
+    if macd_value > macd_signal_value:
+        call_score += 15
+        reasons_call.append("MACD bullish")
+
+    elif macd_value < macd_signal_value:
+        put_score += 15
+        reasons_put.append("MACD bearish")
+
+    # CCI
+    if cci_value > 0:
+        call_score += 10
+        reasons_call.append("CCI positive")
+
+    elif cci_value < 0:
+        put_score += 10
+        reasons_put.append("CCI negative")
+
+    # Fractal
+    if fractal == "BULLISH":
+        call_score += 15
+        reasons_call.append("Bullish fractal")
+
+    elif fractal == "BEARISH":
+        put_score += 15
+        reasons_put.append("Bearish fractal")
+
+    # Momentum
+    if len(prices) >= 6:
+
+        momentum = prices[-1] - prices[-6]
+
+        if momentum > 0:
+            call_score += 10
+        elif momentum < 0:
+            put_score += 10
+
+    # --------------------------------------------------------
+    # FINAL DECISION
+    # --------------------------------------------------------
+
+    difference = abs(call_score - put_score)
+
+    confidence = clamp(
+        max(call_score, put_score)
+    )
+
+    # Strong confirmation required
+    if call_score > put_score and confidence >= MIN_CONFIDENCE:
+        signal = "CALL"
+        explanation = " | ".join(reasons_call)
+
+    elif put_score > call_score and confidence >= MIN_CONFIDENCE:
+        signal = "PUT"
+        explanation = " | ".join(reasons_put)
+
+    else:
+        signal = "WAIT"
+
+        if call_score > put_score:
+            explanation = "Bullish conditions but confirmation is insufficient."
+        elif put_score > call_score:
+            explanation = "Bearish conditions but confirmation is insufficient."
+        else:
+            explanation = "Indicators are mixed."
+
+        confidence = min(confidence, MIN_CONFIDENCE - 1)
+
+    state["signal"] = signal
+    state["confidence"] = int(confidence)
+
+    if signal in ("CALL", "PUT"):
+        state["entry"] = current
+        state["entry_window"] = ENTRY_WINDOW
+        state["last_signal_time"] = utc_string()
+
+    state["analysis"] = explanation
+
+    state["server_time"] = utc_string()
+
+
+# ------------------------------------------------------------
+# JSON FEED
+# ------------------------------------------------------------
+
+def process_json(data):
+
+    asset = data.get("asset", "UNKNOWN")
+
+    state["asset"] = asset
+    state["feed"] = "LIVE"
+    state["image_received"] = False
+    state["last_update"] = now()
+
+    prices = data.get("prices")
+
+    # If an upstream analyzer supplied candles, use them.
+    if isinstance(prices, list) and len(prices) >= 60:
+
+        try:
+            analyze_prices(
+                prices,
+                asset
+            )
             return True
 
-    return False
+        except Exception as exc:
+
+            state["analysis"] = (
+                f"Analysis error: {exc}"
+            )
+
+    # Accept an externally supplied current price.
+    if "price" in data:
+
+        try:
+            state["price"] = float(
+                data["price"]
+            )
+
+        except Exception:
+            pass
+
+    # Accept externally supplied analysis values
+    # when the screen analyzer already calculated them.
+
+    if "signal" in data:
+        supplied_signal = str(
+            data["signal"]
+        ).upper()
+
+        if supplied_signal in (
+            "CALL",
+            "PUT",
+            "WAIT"
+        ):
+            state["signal"] = supplied_signal
+
+    if "confidence" in data:
+
+        try:
+            state["confidence"] = int(
+                float(data["confidence"])
+            )
+
+        except Exception:
+            pass
+
+    if "entry" in data:
+
+        try:
+            state["entry"] = float(
+                data["entry"]
+            )
+
+        except Exception:
+            pass
+
+    if "candles" in data:
+
+        try:
+            state["candles"] = int(
+                data["candles"]
+            )
+
+        except Exception:
+            pass
+
+    if "entry_window" in data:
+
+        try:
+            state["entry_window"] = int(
+                data["entry_window"]
+            )
+
+        except Exception:
+            pass
+
+    state["server_time"] = utc_string()
+
+    state["analysis"] = (
+        "Live feed accepted."
+    )
+
+    return True
 
 
-def valid_image(data):
-    if not data or len(data) < 20:
+# ------------------------------------------------------------
+# IMAGE FEED
+# ------------------------------------------------------------
+
+def process_image(raw):
+
+    image = decode_image(raw)
+
+    if image is None:
         return False
 
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
+    state["feed"] = "LIVE"
+    state["image_received"] = True
+    state["last_update"] = now()
 
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
+    state["server_time"] = utc_string()
 
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
+    # The image is successfully received.
+    # Price extraction is deliberately conservative.
+    estimated = estimate_price_from_image(image)
 
-    return False
+    if estimated is not None:
+        state["price"] = estimated
+
+    state["analysis"] = (
+        "Live screen received."
+    )
+
+    return True
 
 
-@app.route("/")
-def index():
-    return render_template_string("""
+# ------------------------------------------------------------
+# FEED HEALTH MONITOR
+# ------------------------------------------------------------
+
+def health_monitor():
+
+    while True:
+
+        try:
+
+            age = now() - state["last_update"]
+
+            if state["last_update"] == 0:
+                state["feed"] = "DISCONNECTED"
+
+            elif age > STALE_SECONDS:
+                state["feed"] = "STALE"
+
+                state["signal"] = "WAIT"
+                state["confidence"] = 0
+
+                state["analysis"] = (
+                    "Feed stale — trading signal locked."
+                )
+
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+
+threading.Thread(
+    target=health_monitor,
+    daemon=True
+).start()
+
+
+# ------------------------------------------------------------
+# HOME DASHBOARD
+# ------------------------------------------------------------
+
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
+
 <title>ALUCARD SIGNAL BOT</title>
 
 <style>
-* {
-    box-sizing: border-box;
-}
 
 body {
-    margin: 0;
-    background: #050505;
-    color: #eee;
-    font-family: Arial, sans-serif;
+    margin:0;
+    background:#050505;
+    color:#eee;
+    font-family:Arial,sans-serif;
 }
 
-.header {
-    padding: 18px;
-    text-align: center;
-    border-bottom: 1px solid #333;
-    background: #0b0b0b;
+header {
+    padding:20px;
+    text-align:center;
+    border-bottom:1px solid #333;
 }
 
-.title {
-    font-size: 28px;
-    font-weight: bold;
-    letter-spacing: 3px;
+h1 {
+    margin:0;
+    letter-spacing:4px;
 }
 
 .subtitle {
-    color: #999;
-    margin-top: 5px;
-    letter-spacing: 2px;
-    font-size: 12px;
-}
-
-.statusbar {
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    flex-wrap: wrap;
-    padding: 12px;
-    background: #090909;
-}
-
-.status {
-    padding: 8px 14px;
-    border: 1px solid #333;
-    border-radius: 20px;
-    font-size: 13px;
-}
-
-.live {
-    color: #7cff8a;
-}
-
-.dead {
-    color: #ff5555;
+    color:#888;
+    margin-top:8px;
 }
 
 .container {
-    max-width: 1200px;
-    margin: auto;
-    padding: 15px;
-}
-
-.card {
-    background: #0d0d0d;
-    border: 1px solid #292929;
-    border-radius: 12px;
-    margin-bottom: 15px;
-    overflow: hidden;
-}
-
-.cardtitle {
-    padding: 12px 15px;
-    border-bottom: 1px solid #292929;
-    font-weight: bold;
-    letter-spacing: 1px;
-}
-
-.selector {
-    padding: 15px;
-}
-
-.search {
-    width: 100%;
-    padding: 13px;
-    border-radius: 8px;
-    border: 1px solid #444;
-    background: #111;
-    color: #fff;
-    font-size: 15px;
-    outline: none;
-}
-
-.categories {
-    display: flex;
-    gap: 7px;
-    overflow-x: auto;
-    padding: 12px 0;
-}
-
-.cat {
-    flex: 0 0 auto;
-    padding: 9px 13px;
-    border-radius: 20px;
-    border: 1px solid #444;
-    background: #111;
-    color: #ccc;
-    cursor: pointer;
-}
-
-.cat.active {
-    background: #222;
-    color: #fff;
-    border-color: #888;
-}
-
-.asset-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fill,minmax(160px,1fr));
-    gap: 7px;
-    max-height: 330px;
-    overflow-y: auto;
-}
-
-.asset {
-    padding: 11px;
-    background: #111;
-    border: 1px solid #292929;
-    border-radius: 7px;
-    cursor: pointer;
-    color: #ccc;
-}
-
-.asset:hover {
-    background: #1b1b1b;
-}
-
-.asset.selected {
-    border-color: #aaa;
-    color: #fff;
-}
-
-.asset.favorite::before {
-    content: "★ ";
-}
-
-.selectedbar {
-    margin-top: 12px;
-    padding: 12px;
-    background: #151515;
-    border-radius: 8px;
-}
-
-.screen {
-    width: 100%;
-    max-height: 700px;
-    display: block;
-    background: #111;
-    object-fit: contain;
-}
-
-.waiting {
-    padding: 70px 20px;
-    text-align: center;
-    color: #777;
+    max-width:1100px;
+    margin:auto;
+    padding:15px;
 }
 
 .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit,minmax(140px,1fr));
-    gap: 10px;
-    padding: 15px;
+    display:grid;
+    grid-template-columns:
+    repeat(auto-fit,minmax(160px,1fr));
+    gap:12px;
 }
 
-.box {
-    background: #111;
-    border: 1px solid #292929;
-    border-radius: 8px;
-    padding: 15px;
+.card {
+    background:#111;
+    border:1px solid #292929;
+    border-radius:10px;
+    padding:16px;
 }
 
 .label {
-    color: #777;
-    font-size: 11px;
-    text-transform: uppercase;
+    color:#777;
+    font-size:12px;
+    text-transform:uppercase;
 }
 
 .value {
-    margin-top: 6px;
-    font-size: 21px;
-    font-weight: bold;
+    font-size:25px;
+    margin-top:7px;
+    font-weight:bold;
 }
 
 .signal {
-    font-size: 30px;
+    font-size:42px;
+    text-align:center;
+    padding:25px;
 }
 
-.footer {
-    text-align: center;
-    padding: 20px;
-    color: #555;
-    font-size: 11px;
+.analysis {
+    margin-top:15px;
+    line-height:1.6;
 }
+
+.live {
+    margin-bottom:15px;
+    padding:12px;
+    border-radius:8px;
+    background:#111;
+}
+
 </style>
+
 </head>
 
 <body>
 
-<div class="header">
-    <div class="title">ALUCARD SIGNAL BOT</div>
-    <div class="subtitle">GOTHIC MARKET INTELLIGENCE</div>
+<header>
+
+<h1>ALUCARD</h1>
+
+<div class="subtitle">
+GOTHIC MARKET INTELLIGENCE
 </div>
 
-<div class="statusbar">
-    <div class="status" id="connection">
-        FEED: DISCONNECTED
-    </div>
-
-    <div class="status" id="frames">
-        FRAMES: 0
-    </div>
-
-    <div class="status">
-        VERSION: ALUCARD-2.3
-    </div>
-</div>
+</header>
 
 <div class="container">
 
-    <div class="card">
-        <div class="cardtitle">
-            ASSET / CURRENCY SELECTOR
-        </div>
+<div class="live">
 
-        <div class="selector">
+Feed:
+<strong id="feed">DISCONNECTED</strong>
 
-            <input
-                id="search"
-                class="search"
-                type="text"
-                placeholder="Search currency, pair, crypto, stock..."
-                oninput="renderAssets()"
-            >
+&nbsp;&nbsp;
 
-            <div id="categories" class="categories"></div>
-
-            <div id="assetList" class="asset-list"></div>
-
-            <div class="selectedbar">
-                ACTIVE ASSET:
-                <strong id="selectedAsset">EUR/USD OTC</strong>
-            </div>
-
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="cardtitle">
-            LIVE SCREEN FEED
-        </div>
-
-        <img
-            id="feedImage"
-            class="screen"
-            style="display:none"
-            alt="Pocket Option live screen"
-        >
-
-        <div id="waiting" class="waiting">
-            Waiting for Pocket Option screen feed...
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="cardtitle">
-            LIVE STATE
-        </div>
-
-        <div class="grid">
-
-            <div class="box">
-                <div class="label">Asset</div>
-                <div class="value" id="asset">
-                    EUR/USD OTC
-                </div>
-            </div>
-
-            <div class="box">
-                <div class="label">Price</div>
-                <div class="value" id="price">--</div>
-            </div>
-
-            <div class="box">
-                <div class="label">Signal</div>
-                <div class="value signal" id="signal">
-                    WAIT
-                </div>
-            </div>
-
-            <div class="box">
-                <div class="label">Confidence</div>
-                <div class="value" id="confidence">
-                    0%
-                </div>
-            </div>
-
-            <div class="box">
-                <div class="label">Frames</div>
-                <div class="value" id="frameCount">
-                    0
-                </div>
-            </div>
-
-            <div class="box">
-                <div class="label">Feed</div>
-                <div class="value" id="feed">
-                    DISCONNECTED
-                </div>
-            </div>
-
-        </div>
-    </div>
+Asset:
+<strong id="asset">UNKNOWN</strong>
 
 </div>
 
-<div class="footer">
-    ALUCARD V2 • LIVE SCREEN INTELLIGENCE
+<div class="card signal">
+
+<div class="label">Signal</div>
+
+<div id="signal">WAIT</div>
+
+</div>
+
+<br>
+
+<div class="grid">
+
+<div class="card">
+<div class="label">Price</div>
+<div class="value" id="price">--</div>
+</div>
+
+<div class="card">
+<div class="label">Confidence</div>
+<div class="value" id="confidence">0%</div>
+</div>
+
+<div class="card">
+<div class="label">Entry</div>
+<div class="value" id="entry">--</div>
+</div>
+
+<div class="card">
+<div class="label">Entry Window</div>
+<div class="value" id="window">--</div>
+</div>
+
+<div class="card">
+<div class="label">Candles</div>
+<div class="value" id="candles">0</div>
+</div>
+
+<div class="card">
+<div class="label">Fractal</div>
+<div class="value" id="fractal">2</div>
+</div>
+
+</div>
+
+<br>
+
+<div class="grid">
+
+<div class="card">
+<div class="label">EMA 9</div>
+<div class="value" id="ema9">--</div>
+</div>
+
+<div class="card">
+<div class="label">EMA 20</div>
+<div class="value" id="ema20">--</div>
+</div>
+
+<div class="card">
+<div class="label">EMA 50</div>
+<div class="value" id="ema50">--</div>
+</div>
+
+<div class="card">
+<div class="label">RSI</div>
+<div class="value" id="rsi">--</div>
+</div>
+
+<div class="card">
+<div class="label">MACD</div>
+<div class="value" id="macd">--</div>
+</div>
+
+<div class="card">
+<div class="label">CCI</div>
+<div class="value" id="cci">--</div>
+</div>
+
+</div>
+
+<div class="card analysis">
+
+<div class="label">Analysis</div>
+
+<div id="analysis">
+Waiting for screen feed...
+</div>
+
+<br>
+
+<div class="label">Server Time</div>
+
+<div id="time">
+--
+</div>
+
+</div>
+
 </div>
 
 <script>
-const ASSETS = {{ assets | tojson }};
-let currentCategory = "FOREX";
-let selectedAsset = "EUR/USD OTC";
-let favorites = [
-    "EUR/USD OTC",
-    "GBP/USD OTC",
-    "USD/JPY OTC",
-    "BTC/USD",
-    "Gold"
-];
-
-function buildCategories() {
-    const box = document.getElementById("categories");
-    box.innerHTML = "";
-
-    const all = document.createElement("button");
-    all.className = "cat";
-    all.textContent = "ALL";
-    all.onclick = function() {
-        currentCategory = "ALL";
-        renderCategories();
-        renderAssets();
-    };
-    box.appendChild(all);
-
-    Object.keys(ASSETS).forEach(function(category) {
-        const button = document.createElement("button");
-
-        button.className = "cat";
-        button.textContent = category;
-
-        button.onclick = function() {
-            currentCategory = category;
-            renderCategories();
-            renderAssets();
-        };
-
-        box.appendChild(button);
-    });
-
-    renderCategories();
-}
-
-function renderCategories() {
-    document.querySelectorAll(".cat").forEach(function(button) {
-        button.classList.remove("active");
-
-        if (
-            button.textContent === currentCategory ||
-            (currentCategory === "ALL" &&
-             button.textContent === "ALL")
-        ) {
-            button.classList.add("active");
-        }
-    });
-}
-
-function renderAssets() {
-    const search = document
-        .getElementById("search")
-        .value
-        .toLowerCase()
-        .trim();
-
-    const list = document.getElementById("assetList");
-    list.innerHTML = "";
-
-    let items = [];
-
-    if (currentCategory === "ALL") {
-        Object.values(ASSETS).forEach(function(group) {
-            items = items.concat(group);
-        });
-    } else {
-        items = ASSETS[currentCategory] || [];
-    }
-
-    items = [...new Set(items)];
-
-    items = items.filter(function(asset) {
-        return asset.toLowerCase().includes(search);
-    });
-
-    items.sort(function(a, b) {
-        const af = favorites.includes(a);
-        const bf = favorites.includes(b);
-
-        if (af && !bf) return -1;
-        if (!af && bf) return 1;
-
-        return a.localeCompare(b);
-    });
-
-    items.forEach(function(asset) {
-        const button = document.createElement("button");
-
-        button.className = "asset";
-
-        if (asset === selectedAsset) {
-            button.classList.add("selected");
-        }
-
-        if (favorites.includes(asset)) {
-            button.classList.add("favorite");
-        }
-
-        button.textContent = asset;
-
-        button.onclick = function() {
-            selectAsset(asset);
-        };
-
-        list.appendChild(button);
-    });
-}
-
-async function selectAsset(asset) {
-    selectedAsset = asset;
-
-    document.getElementById("selectedAsset").textContent = asset;
-    document.getElementById("asset").textContent = asset;
-
-    renderAssets();
-
-    try {
-        await fetch("/api/select_asset", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                asset: asset
-            })
-        });
-    } catch (e) {
-        console.log("asset selection error", e);
-    }
-}
 
 async function update() {
+
     try {
+
         const response =
-            await fetch("/api/status?t=" + Date.now());
+            await fetch("/api/state");
 
-        const s = await response.json();
+        const s =
+            await response.json();
 
-        selectedAsset = s.asset || selectedAsset;
-
-        document.getElementById("selectedAsset")
-            .textContent = selectedAsset;
+        document.getElementById("feed")
+            .textContent = s.feed;
 
         document.getElementById("asset")
-            .textContent = selectedAsset;
+            .textContent = s.asset;
 
-        const live =
-            s.connected === true &&
-            s.feed === "LIVE";
-
-        const connection =
-            document.getElementById("connection");
-
-        connection.textContent =
-            live
-            ? "FEED: LIVE"
-            : "FEED: DISCONNECTED";
-
-        connection.className =
-            "status " + (live ? "live" : "dead");
-
-        document.getElementById("frames")
-            .textContent =
-            "FRAMES: " + (s.frame_count || 0);
+        document.getElementById("signal")
+            .textContent = s.signal;
 
         document.getElementById("price")
             .textContent =
-            s.price && Number(s.price) !== 0
-            ? Number(s.price).toFixed(5)
-            : "--";
-
-        document.getElementById("signal")
-            .textContent =
-            s.signal || "WAIT";
+            Number(s.price || 0).toFixed(6);
 
         document.getElementById("confidence")
             .textContent =
-            (s.confidence || 0) + "%";
+            s.confidence + "%";
 
-        document.getElementById("frameCount")
+        document.getElementById("entry")
             .textContent =
-            s.frame_count || 0;
+            Number(s.entry || 0).toFixed(6);
 
-        document.getElementById("feed")
+        document.getElementById("window")
             .textContent =
-            s.feed || "DISCONNECTED";
+            s.entry_window + "s";
 
-        if (s.image_received && s.frame_count > 0) {
-            const img =
-                document.getElementById("feedImage");
+        document.getElementById("candles")
+            .textContent = s.candles;
 
-            const waiting =
-                document.getElementById("waiting");
+        document.getElementById("fractal")
+            .textContent = s.fractal_period;
 
-            img.src =
-                "/api/frame.jpg?t=" + Date.now();
+        document.getElementById("ema9")
+            .textContent =
+            Number(s.ema9 || 0).toFixed(6);
 
-            img.style.display = "block";
-            waiting.style.display = "none";
-        }
+        document.getElementById("ema20")
+            .textContent =
+            Number(s.ema20 || 0).toFixed(6);
+
+        document.getElementById("ema50")
+            .textContent =
+            Number(s.ema50 || 0).toFixed(6);
+
+        document.getElementById("rsi")
+            .textContent =
+            Number(s.rsi || 0).toFixed(2);
+
+        document.getElementById("macd")
+            .textContent =
+            Number(s.macd || 0).toFixed(6);
+
+        document.getElementById("cci")
+            .textContent =
+            Number(s.cci || 0).toFixed(2);
+
+        document.getElementById("analysis")
+            .textContent = s.analysis;
+
+        document.getElementById("time")
+            .textContent = s.server_time || "--";
 
     } catch (e) {
-        console.log("status error", e);
+
+        document.getElementById("feed")
+            .textContent = "OFFLINE";
+
     }
+
 }
 
-buildCategories();
-renderAssets();
+setInterval(update,1000);
+
 update();
-setInterval(update, 2000);
+
 </script>
 
 </body>
 </html>
-""", assets=ASSETS)
+"""
 
 
-@app.route("/api/status")
-def api_status():
-    with LOCK:
-        state = dict(STATE)
+# ------------------------------------------------------------
+# ROUTES
+# ------------------------------------------------------------
 
-    if state["last_update"]:
-        age = time.time() - state["last_update"]
+@app.route("/")
+def home():
 
-        if age > FEED_TIMEOUT:
-            state["connected"] = False
-            state["feed"] = "DISCONNECTED"
+    return render_template_string(
+        HTML
+    )
+
+
+@app.route("/api/health")
+def health():
+
+    return jsonify({
+        "ok": True,
+        "service": "ALUCARD",
+        "version": VERSION,
+        "feed": state["feed"],
+        "timestamp": utc_string()
+    })
+
+
+@app.route("/api/state")
+def api_state():
 
     return jsonify(state)
 
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "version": VERSION,
-        "feed": STATE["feed"],
-        "frame_count": STATE["frame_count"]
-    })
-
-
-@app.route("/api/select_asset", methods=["POST"])
-def select_asset():
-    if not authorized():
-        return jsonify({
-            "ok": False,
-            "error": "Unauthorized"
-        }), 401
-
-    data = request.get_json(silent=True) or {}
-    asset = str(data.get("asset", "")).strip()
-
-    all_assets = []
-
-    for group in ASSETS.values():
-        all_assets.extend(group)
-
-    if asset not in all_assets:
-        return jsonify({
-            "ok": False,
-            "error": "Asset not available"
-        }), 400
-
-    with LOCK:
-        STATE["asset"] = asset
-        STATE["signal"] = "WAIT"
-        STATE["confidence"] = 0
-
-    return jsonify({
-        "ok": True,
-        "asset": asset
-    })
-
-
 @app.route("/api/feed", methods=["POST"])
 def api_feed():
-    if not authorized():
+
+    if not authorized(request):
+
         return jsonify({
             "ok": False,
             "error": "Unauthorized"
         }), 401
 
-    data = request.get_json(silent=True)
+    try:
 
-    if not data:
-        return jsonify({
-            "ok": False,
-            "error": "No JSON data received"
-        }), 400
+        # -----------------------------------------------
+        # IMAGE / SCREEN FEED
+        # -----------------------------------------------
 
-    with LOCK:
-        for key in [
-            "asset",
-            "price",
-            "signal",
-            "confidence",
-            "entry",
-            "entry_window",
-            "candles"
-        ]:
-            if key in data:
-                STATE[key] = data[key]
+        if request.files:
 
-        STATE["feed"] = data.get("feed", "LIVE")
-        STATE["connected"] = True
-        STATE["last_update"] = time.time()
+            uploaded = next(
+                iter(request.files.values()),
+                None
+            )
 
-    return jsonify({
-        "ok": True,
-        "message": "JSON feed accepted",
-        "feed": "LIVE",
-        "state": STATE
-    })
+            if uploaded:
 
+                raw = uploaded.read()
 
-@app.route("/api/frame", methods=["POST"])
-def api_frame():
-    global FRAME_DATA
-    global FRAME_CONTENT_TYPE
+                if process_image(raw):
 
-    if not authorized():
-        return jsonify({
-            "ok": False,
-            "error": "Unauthorized"
-        }), 401
+                    return jsonify({
+                        "ok": True,
+                        "message": "Screen image accepted",
+                        "state": state
+                    })
 
-    image_data = None
+        # -----------------------------------------------
+        # RAW IMAGE BODY
+        # -----------------------------------------------
 
-    content_type = request.content_type or ""
-
-    if "multipart/form-data" in content_type:
-        uploaded = (
-            request.files.get("image")
-            or request.files.get("frame")
+        content_type = (
+            request.headers
+            .get("Content-Type", "")
+            .lower()
         )
 
-        if uploaded:
-            image_data = uploaded.read()
+        if (
+            content_type.startswith("image/")
+            or content_type == "application/octet-stream"
+        ):
 
-    else:
-        image_data = request.get_data()
+            raw = request.get_data()
 
-    detected_type = valid_image(image_data)
+            if raw:
 
-    if not detected_type:
-        return jsonify({
-            "ok": False,
-            "error": "Invalid or missing image"
-        }), 400
+                if process_image(raw):
 
-    with LOCK:
-        FRAME_DATA = image_data
-        FRAME_CONTENT_TYPE = detected_type
+                    return jsonify({
+                        "ok": True,
+                        "message": "Image feed accepted",
+                        "state": state
+                    })
 
-        STATE["last_update"] = time.time()
-        STATE["last_frame"] = time.time()
-        STATE["connected"] = True
-        STATE["feed"] = "LIVE"
-        STATE["image_received"] = True
-        STATE["frame_count"] += 1
+        # -----------------------------------------------
+        # JSON FEED
+        # -----------------------------------------------
 
-        count = STATE["frame_count"]
-
-    return jsonify({
-        "ok": True,
-        "message": "Screen frame accepted",
-        "feed": "LIVE",
-        "frame_count": count
-    })
-
-
-@app.route("/api/frame.jpg")
-def frame_image():
-    with LOCK:
-        data = FRAME_DATA
-        content_type = FRAME_CONTENT_TYPE
-
-    if not data:
-        return Response(
-            "No frame received",
-            status=404,
-            mimetype="text/plain"
+        data = request.get_json(
+            silent=True
         )
 
-    return Response(
-        data,
-        status=200,
-        mimetype=content_type,
-        headers={
-            "Cache-Control":
-                "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache"
-        }
+        if data is not None:
+
+            if process_json(data):
+
+                return jsonify({
+                    "ok": True,
+                    "message": "JSON feed accepted",
+                    "state": state
+                })
+
+        return jsonify({
+            "ok": False,
+            "error": "No valid JSON or image feed received"
+        }), 400
+
+    except Exception as exc:
+
+        return jsonify({
+            "ok": False,
+            "error": str(exc)
+        }), 500
+
+
+# ------------------------------------------------------------
+# START
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    port = int(
+        os.getenv("PORT", "5000")
     )
 
-
-def monitor():
-    while True:
-        time.sleep(3)
-
-        with LOCK:
-            STATE["scan"] += 1
-
-            if STATE["last_update"]:
-                age = time.time() - STATE["last_update"]
-
-                if age > FEED_TIMEOUT:
-                    STATE["connected"] = False
-                    STATE
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
