@@ -5,18 +5,11 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-# ============================================================
-# ALUCARD SIGNAL BOT
-# SCREEN-FEED READY / RENDER READY
-# ============================================================
-
-VERSION = "ALUCARD-2.0"
+VERSION = "ALUCARD-2.1"
 
 RTSP_FEED_URL = os.getenv("RTSP_FEED_URL", "").strip()
 FEED_TOKEN = os.getenv("FEED_TOKEN", "").strip()
-
 DEFAULT_ASSET = os.getenv("DEFAULT_ASSET", "EUR/USD OTC")
-
 FRAME_TIMEOUT = int(os.getenv("FRAME_TIMEOUT", "15"))
 
 state = {
@@ -34,25 +27,32 @@ state = {
 }
 
 
-# ============================================================
-# CONNECTION MONITOR
-# ============================================================
+def authorized():
+    if not FEED_TOKEN:
+        return True
+
+    return request.headers.get("X-Feed-Token", "") == FEED_TOKEN
+
 
 def monitor():
     while True:
-        now = time.time()
+        try:
+            now = time.time()
 
-        if state["last_update"] > 0:
-            age = now - state["last_update"]
+            if state["last_update"] > 0:
+                age = now - state["last_update"]
 
-            if age <= FRAME_TIMEOUT:
-                state["connected"] = True
-                state["feed"] = "LIVE"
-            else:
-                state["connected"] = False
-                state["feed"] = "STALE / DISCONNECTED"
+                if age <= FRAME_TIMEOUT:
+                    state["connected"] = True
+                    state["feed"] = "LIVE"
+                else:
+                    state["connected"] = False
+                    state["feed"] = "STALE / DISCONNECTED"
 
-        state["scan"] += 1
+            state["scan"] += 1
+
+        except Exception:
+            pass
 
         time.sleep(5)
 
@@ -60,22 +60,14 @@ def monitor():
 threading.Thread(target=monitor, daemon=True).start()
 
 
-# ============================================================
-# DASHBOARD
-# ============================================================
-
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ALUCARD SIGNAL BOT</title>
 
 <style>
-
 * {
     box-sizing: border-box;
 }
@@ -180,24 +172,22 @@ body {
             rgba(255,255,255,.035) 1px,
             transparent 1px
         );
-
     background-size: 35px 35px;
-
     border: 1px solid #292933;
     border-radius: 12px;
-
     display: flex;
     align-items: center;
     justify-content: center;
-
     color: #555;
     text-align: center;
+    padding: 15px;
 }
 
 .feed-image {
     max-width: 100%;
     max-height: 600px;
     border-radius: 8px;
+    margin-top: 15px;
     display: none;
 }
 
@@ -213,7 +203,6 @@ body {
 }
 
 @media(max-width:700px) {
-
     .status {
         grid-template-columns: 1fr;
     }
@@ -225,130 +214,88 @@ body {
     .chart {
         min-height: 260px;
     }
-
 }
-
 </style>
-
 </head>
 
 <body>
 
 <div class="header">
-
-    <div class="title">
-        ALUCARD SIGNAL BOT
-    </div>
-
-    <div class="subtitle">
-        GOTHIC MARKET INTELLIGENCE
-    </div>
-
+    <div class="title">ALUCARD SIGNAL BOT</div>
+    <div class="subtitle">GOTHIC MARKET INTELLIGENCE</div>
 </div>
-
 
 <div class="container">
 
     <div class="status">
 
         <div class="card">
-
-            <div class="label">
-                Screen Feed
-            </div>
-
-            <div id="feed"
-                 class="value wait">
+            <div class="label">Screen Feed</div>
+            <div id="feed" class="value wait">
                 WAITING FOR SCREEN FEED
             </div>
-
         </div>
 
-
         <div class="card">
-
-            <div class="label">
-                Asset
-            </div>
-
-            <div id="asset"
-                 class="value">
+            <div class="label">Asset</div>
+            <div id="asset" class="value">
                 EUR/USD OTC
             </div>
-
         </div>
 
-
         <div class="card">
-
-            <div class="label">
-                Scan
-            </div>
-
-            <div id="scan"
-                 class="value">
+            <div class="label">Scan</div>
+            <div id="scan" class="value">
                 0
             </div>
-
         </div>
 
     </div>
 
-
     <div class="card signal">
 
-        <div class="label">
-            Current Signal
-        </div>
+        <div class="label">Current Signal</div>
 
-        <div id="signal"
-             class="signal-name">
+        <div id="signal" class="signal-name">
             WAIT
         </div>
 
-        <div id="confidence"
-             class="confidence">
+        <div id="confidence" class="confidence">
             Confidence: 0%
         </div>
 
     </div>
 
-
     <div class="chart">
 
-        <div>
+        <div style="width:100%;">
 
             <div style="font-size:20px;">
                 POCKET OPTION SCREEN FEED
             </div>
 
-            <div id="frameStatus"
-                 style="margin-top:8px;">
+            <div id="frameStatus" style="margin-top:8px;">
                 Waiting for Android frame...
             </div>
 
-            <img id="feedImage"
-                 class="feed-image">
+            <img id="feedImage" class="feed-image">
 
         </div>
 
     </div>
 
-
     <div class="notice">
-
-        ALUCARD is waiting for the Android Pocket Option
+        ALUCARD is receiving the Android Pocket Option
         screen feed.
 
-        Keep Pocket Option visible while the Android
-        screen bridge is running.
+        Keep the Screen Stream service active while the
+        Android bridge is running.
 
-        This dashboard does not place trades.
-
+        Screen capture confirms feed connectivity.
+        Signal analysis is separate from feed transport.
     </div>
 
 </div>
-
 
 <script>
 
@@ -356,58 +303,36 @@ async function updateStatus() {
 
     try {
 
-        const response =
-            await fetch("/api/status");
-
-        const data =
-            await response.json();
-
+        const response = await fetch("/api/status");
+        const data = await response.json();
 
         document.getElementById("feed").textContent =
             data.feed;
 
-
         document.getElementById("asset").textContent =
             data.asset;
-
 
         document.getElementById("scan").textContent =
             data.scan;
 
-
         document.getElementById("signal").textContent =
             data.signal;
-
 
         document.getElementById("confidence").textContent =
             "Confidence: " + data.confidence + "%";
 
-
-        const feed =
-            document.getElementById("feed");
-
+        const feed = document.getElementById("feed");
 
         if (data.connected) {
-
-            feed.className =
-                "value live";
-
+            feed.className = "value live";
         } else if (data.feed.includes("STALE")) {
-
-            feed.className =
-                "value dead";
-
+            feed.className = "value dead";
         } else {
-
-            feed.className =
-                "value wait";
-
+            feed.className = "value wait";
         }
-
 
         const frameStatus =
             document.getElementById("frameStatus");
-
 
         if (data.image_received) {
 
@@ -423,20 +348,15 @@ async function updateStatus() {
 
         }
 
-    }
-
-    catch (error) {
+    } catch (error) {
 
         document.getElementById("feed").textContent =
             "SERVER ERROR";
 
     }
-
 }
 
-
 updateStatus();
-
 setInterval(updateStatus, 3000);
 
 </script>
@@ -446,339 +366,157 @@ setInterval(updateStatus, 3000);
 """
 
 
-# ============================================================
-# HOME
-# ============================================================
-
 @app.route("/")
 def home():
     return render_template_string(HTML)
 
 
-# ============================================================
-# STATUS
-# ============================================================
-
 @app.route("/api/status")
 def status():
 
     return jsonify({
-
         "version": VERSION,
-
-        "connected":
-            state["connected"],
-
-        "feed":
-            state["feed"],
-
-        "asset":
-            state["asset"],
-
-        "price":
-            state["price"],
-
-        "signal":
-            state["signal"],
-
-        "confidence":
-            state["confidence"],
-
-        "scan":
-            state["scan"],
-
-        "frame_count":
-            state["frame_count"],
-
-        "image_received":
-            state["image_received"],
-
-        "rtsp_configured":
-            bool(RTSP_FEED_URL),
-
-        "last_update":
-            state["last_update"],
-
+        "connected": state["connected"],
+        "feed": state["feed"],
+        "asset": state["asset"],
+        "price": state["price"],
+        "signal": state["signal"],
+        "confidence": state["confidence"],
+        "scan": state["scan"],
+        "frame_count": state["frame_count"],
+        "image_received": state["image_received"],
+        "rtsp_configured": bool(RTSP_FEED_URL),
+        "last_update": state["last_update"],
     })
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.route("/health")
 def health():
 
     return jsonify({
-
         "status": "ok",
-
-        "service":
-            "Alucard Signal Bot",
-
-        "version":
-            VERSION
-
+        "service": "Alucard Signal Bot",
+        "version": VERSION
     })
 
-
-# ============================================================
-# JSON FEED
-# ============================================================
 
 @app.route("/api/feed", methods=["POST"])
 def feed():
 
-    if FEED_TOKEN:
+    if not authorized():
 
-        supplied =
-            request.headers.get(
-                "X-Feed-Token",
-                ""
-            )
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized"
+        }), 401
 
-        if supplied != FEED_TOKEN:
+    data = request.get_json(silent=True) or {}
 
-            return jsonify({
-                "ok": False,
-                "error": "unauthorized"
-            }), 401
+    now = time.time()
 
-
-    data =
-        request.get_json(
-            silent=True
-        ) or {}
-
-
-    state["last_update"] =
-        time.time()
-
+    state["last_update"] = now
 
     if "asset" in data:
-
-        state["asset"] =
-            str(data["asset"])
-
+        state["asset"] = str(data["asset"])
 
     if "price" in data:
 
         try:
-
-            state["price"] =
-                float(data["price"])
-
+            state["price"] = float(data["price"])
         except Exception:
             pass
 
-
     if "signal" in data:
 
-        signal =
-            str(data["signal"]).upper()
+        signal = str(data["signal"]).upper()
 
-        if signal in [
-            "CALL",
-            "PUT",
-            "WAIT"
-        ]:
-
-            state["signal"] =
-                signal
-
+        if signal in ["CALL", "PUT", "WAIT"]:
+            state["signal"] = signal
 
     if "confidence" in data:
 
         try:
-
-            state["confidence"] =
-                max(
-                    0,
-                    min(
-                        100,
-                        int(
-                            float(
-                                data["confidence"]
-                            )
-                        )
-                    )
+            state["confidence"] = max(
+                0,
+                min(
+                    100,
+                    int(float(data["confidence"]))
                 )
-
+            )
         except Exception:
             pass
-
 
     state["connected"] = True
     state["feed"] = "LIVE"
 
-
     return jsonify({
-
         "ok": True,
-
-        "message":
-            "JSON feed accepted",
-
-        "feed":
-            "LIVE"
-
+        "message": "JSON feed accepted",
+        "feed": "LIVE"
     })
 
-
-# ============================================================
-# IMAGE / SCREEN FRAME RECEIVER
-# ============================================================
 
 @app.route("/api/frame", methods=["POST"])
 def frame():
 
-    if FEED_TOKEN:
+    if not authorized():
 
-        supplied =
-            request.headers.get(
-                "X-Feed-Token",
-                ""
-            )
-
-        if supplied != FEED_TOKEN:
-
-            return jsonify({
-                "ok": False,
-                "error": "unauthorized"
-            }), 401
-
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized"
+        }), 401
 
     image_data = None
 
-
-    # --------------------------------------------
-    # multipart/form-data
-    # --------------------------------------------
-
     if "image" in request.files:
-
-        image_data =
-            request.files["image"].read()
-
+        image_data = request.files["image"].read()
 
     elif "frame" in request.files:
-
-        image_data =
-            request.files["frame"].read()
-
-
-    # --------------------------------------------
-    # raw image body
-    # --------------------------------------------
+        image_data = request.files["frame"].read()
 
     elif request.data:
-
-        image_data =
-            request.data
-
+        image_data = request.data
 
     if not image_data:
 
         return jsonify({
-
             "ok": False,
-
-            "error":
-                "No image/frame received"
-
+            "error": "No image/frame received"
         }), 400
 
-
-    # Basic image validation.
-    # JPEG and PNG files have recognizable signatures.
-
-    is_jpeg =
-        image_data.startswith(b"\\xff\\xd8\\xff")
-
-    is_png =
-        image_data.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
-
+    is_jpeg = image_data.startswith(b"\xff\xd8\xff")
+    is_png = image_data.startswith(b"\x89PNG\r\n\x1a\n")
 
     if not (is_jpeg or is_png):
 
         return jsonify({
-
             "ok": False,
-
-            "error":
-                "Unsupported image format"
-
+            "error": "Unsupported image format"
         }), 400
 
+    now = time.time()
 
-    now =
-        time.time()
-
-
-    state["last_update"] =
-        now
-
-    state["last_frame"] =
-        now
-
-    state["connected"] =
-        True
-
-    state["feed"] =
-        "LIVE"
-
-    state["image_received"] =
-        True
-
+    state["last_update"] = now
+    state["last_frame"] = now
+    state["connected"] = True
+    state["feed"] = "LIVE"
+    state["image_received"] = True
     state["frame_count"] += 1
 
-
     return jsonify({
-
         "ok": True,
-
-        "message":
-            "Screen frame accepted",
-
-        "feed":
-            "LIVE",
-
-        "frame_count":
-            state["frame_count"]
-
+        "message": "Screen frame accepted",
+        "feed": "LIVE",
+        "frame_count": state["frame_count"]
     })
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
 
-    port =
-        int(
-            os.getenv(
-                "PORT",
-                "10000"
-            )
-        )
+    port = int(os.getenv("PORT", "10000"))
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
         debug=False
-
     )
-
-
-
-Important: this first replacement makes ALUCARD capable of receiving screen frames. It does not pretend that a screenshot automatically produces a reliable CALL/PUT signal—we'll handle the actual screen analysis separately.
-
-Your existing "requirements.txt" can stay as-is because the repository already uses Flask and Gunicorn.
-
-Do only this step now: save/commit the new "main.py" to GitHub.
-
-Then tell me “done”.
