@@ -1,25 +1,22 @@
 import os
-import io
 import time
-from collections import deque
+import threading
+from datetime import datetime, timezone
 
-import numpy as np
-from PIL import Image
 from flask import Flask, jsonify, request, render_template_string
+from PIL import Image
 
 app = Flask(__name__)
 
-TOKEN = (
-    os.getenv("RYU_FEED_TOKEN")
-    or os.getenv("ALUCARD_FEED_TOKEN")
-    or ""
-)
-
-VERSION = "ALUCARD-ANALYTICS-4.0"
-
 # ============================================================
-# STATE
+# ALUCARD V2 — GOTHIC MARKET INTELLIGENCE
+# Flask + Gunicorn + Pillow + Requests ONLY
+# No cv2 / OpenCV required
 # ============================================================
+
+VERSION = "ALUCARD-2.1"
+
+RYU_FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "")
 
 state = {
     "feed": "DISCONNECTED",
@@ -28,783 +25,522 @@ state = {
 
     "signal": "WAIT",
     "confidence": 0,
+
     "entry": 0.0,
     "entry_window": 12,
 
     "candles": 0,
-    "image_received": False,
-
-    "last_feed": 0.0,
-
-    "analysis": "Waiting for screen feed...",
+    "fractal": 2,
 
     "ema9": 0.0,
     "ema20": 0.0,
     "ema50": 0.0,
 
     "rsi": 0.0,
-    "atr": 0.0,
-    "cci": 0.0,
-
     "macd": 0.0,
-    "macd_signal": 0.0,
-
-    "sar": 0.0,
-
-    "fractal": 2,
+    "cci": 0.0,
+    "atr": 0.0,
 
     "payout": 0,
+    "expiry": 300,
+
+    "analysis": "Waiting for screen feed...",
+
+    "image_received": False,
+    "last_feed": 0,
+
+    "feed_age": 0,
+    "server_time": "",
 }
 
-prices = deque(maxlen=300)
-
-screen_frame = {
-    "bytes": None,
-    "mime": "image/jpeg",
-    "time": 0.0,
-}
 
 # ============================================================
-# HELPERS
+# FEED HEALTH
 # ============================================================
 
-def auth_ok():
-    if not TOKEN:
+def update_feed_health():
+    while True:
+        try:
+            last = state.get("last_feed", 0)
+
+            if last == 0:
+                state["feed"] = "DISCONNECTED"
+                state["feed_age"] = 0
+            else:
+                age = time.time() - last
+                state["feed_age"] = round(age, 1)
+
+                if age <= 10:
+                    state["feed"] = "LIVE"
+                elif age <= 30:
+                    state["feed"] = "STALE"
+                else:
+                    state["feed"] = "DISCONNECTED"
+
+            state["server_time"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+
+threading.Thread(
+    target=update_feed_health,
+    daemon=True
+).start()
+
+
+# ============================================================
+# SAFE NUMBER
+# ============================================================
+
+def num(value, default=0.0):
+    try:
+        if value is None:
+            return default
+
+        if isinstance(value, bool):
+            return default
+
+        return float(value)
+
+    except Exception:
+        return default
+
+
+def integer(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+# ============================================================
+# TOKEN CHECK
+# ============================================================
+
+def valid_token(req):
+    if not RYU_FEED_TOKEN:
         return True
 
-    supplied = (
-        request.headers.get("X-RYU-TOKEN")
-        or request.headers.get("X-ALUCARD-TOKEN")
-    )
+    supplied = req.headers.get("X-RYU-TOKEN", "")
 
-    return supplied == TOKEN
-
-
-def ema(values, period):
-    if len(values) == 0:
-        return 0.0
-
-    alpha = 2.0 / (period + 1.0)
-
-    value = float(values[0])
-
-    for v in values[1:]:
-        value = alpha * float(v) + (1.0 - alpha) * value
-
-    return value
-
-
-def calculate_indicators(values):
-    if len(values) == 0:
-        return (
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )
-
-    x = np.asarray(values, dtype=float)
-
-    ema9 = ema(x, 9)
-    ema20 = ema(x, 20)
-    ema50 = ema(x, 50)
-
-    if len(x) < 2:
-        return (
-            ema9,
-            ema20,
-            ema50,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )
-
-    differences = np.diff(x)
-
-    gains = np.maximum(differences, 0)
-    losses = np.maximum(-differences, 0)
-
-    period = min(14, len(differences))
-
-    avg_gain = float(gains[-period:].mean())
-    avg_loss = float(losses[-period:].mean())
-
-    if avg_loss == 0:
-        rsi = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-
-    true_ranges = np.abs(differences)
-
-    atr = (
-        float(true_ranges[-period:].mean())
-        if len(true_ranges)
-        else 0.0
-    )
-
-    recent = x[-period:]
-
-    sma = float(recent.mean())
-    deviation = float(recent.std())
-
-    if deviation == 0:
-        cci = 0.0
-    else:
-        cci = float(
-            (x[-1] - sma)
-            / (0.015 * deviation)
-        )
-
-    macd = ema(x, 12) - ema(x, 26)
-
-    if len(x) >= 26:
-
-        macd_history = []
-
-        for i in range(26, len(x) + 1):
-            section = x[:i]
-
-            value = (
-                ema(section, 12)
-                - ema(section, 26)
-            )
-
-            macd_history.append(value)
-
-        macd_signal = ema(
-            np.asarray(macd_history),
-            9,
-        )
-
-    else:
-        macd_signal = macd
-
-    return (
-        ema9,
-        ema20,
-        ema50,
-        rsi,
-        atr,
-        cci,
-        macd,
-        macd_signal,
-    )
+    return supplied == RYU_FEED_TOKEN
 
 
 # ============================================================
-# ANALYSIS ENGINE
+# SIMPLE ANALYSIS ENGINE
 # ============================================================
 
-def analyze_market():
+def calculate_analysis():
 
-    values = list(prices)
+    price = num(state["price"])
+    ema9 = num(state["ema9"])
+    ema20 = num(state["ema20"])
+    ema50 = num(state["ema50"])
+    rsi = num(state["rsi"])
+    macd = num(state["macd"])
+    cci = num(state["cci"])
 
-    if not values:
-        return
+    if state["feed"] != "LIVE":
+        return "Waiting for live screen feed..."
 
-    (
-        ema9,
-        ema20,
-        ema50,
-        rsi,
-        atr,
-        cci,
-        macd,
-        macd_signal,
-    ) = calculate_indicators(values)
+    if price <= 0:
+        return "Waiting for valid price..."
 
-    call_score = 0
-    put_score = 0
+    score_call = 0
+    score_put = 0
 
-    # EMA 9 / 20
-    if ema9 > ema20:
-        call_score += 20
-    elif ema9 < ema20:
-        put_score += 20
+    # EMA structure
+    if ema9 > 0 and ema20 > 0:
+        if ema9 > ema20:
+            score_call += 1
+        elif ema9 < ema20:
+            score_put += 1
 
-    # EMA 20 / 50
-    if ema20 > ema50:
-        call_score += 20
-    elif ema20 < ema50:
-        put_score += 20
-
-    # MACD
-    if macd > macd_signal:
-        call_score += 20
-    elif macd < macd_signal:
-        put_score += 20
+    if ema20 > 0 and ema50 > 0:
+        if ema20 > ema50:
+            score_call += 1
+        elif ema20 < ema50:
+            score_put += 1
 
     # RSI
     if rsi > 50:
-        call_score += 10
-    elif rsi < 50:
-        put_score += 10
+        score_call += 1
+    elif 0 < rsi < 50:
+        score_put += 1
+
+    # MACD
+    if macd > 0:
+        score_call += 1
+    elif macd < 0:
+        score_put += 1
 
     # CCI
     if cci > 0:
-        call_score += 10
+        score_call += 1
     elif cci < 0:
-        put_score += 10
+        score_put += 1
 
-    # Short-term price direction
-    if len(values) >= 3:
+    total = score_call + score_put
 
-        if (
-            values[-1]
-            > values[-2]
-            > values[-3]
-        ):
-            call_score += 20
+    if total == 0:
+        return "Live feed active — collecting indicators..."
 
-        elif (
-            values[-1]
-            < values[-2]
-            < values[-3]
-        ):
-            put_score += 20
+    if score_call > score_put:
+        strength = int(
+            50 + ((score_call - score_put) * 10)
+        )
+        strength = min(strength, 95)
+
+        if strength >= 78:
+            state["signal"] = "CALL"
+            state["confidence"] = strength
+            return "Bullish alignment detected."
+
+        return "Bullish bias — waiting for confirmation."
+
+    if score_put > score_call:
+        strength = int(
+            50 + ((score_put - score_call) * 10)
+        )
+        strength = min(strength, 95)
+
+        if strength >= 78:
+            state["signal"] = "PUT"
+            state["confidence"] = strength
+            return "Bearish alignment detected."
+
+        return "Bearish bias — waiting for confirmation."
+
+    return "Indicators are mixed — WAIT."
+
+
+# ============================================================
+# JSON FEED
+# ============================================================
+
+@app.route("/api/feed", methods=["POST"])
+def receive_feed():
+
+    if not valid_token(request):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
 
     # --------------------------------------------------------
-    # SIGNAL
+    # IMAGE / SCREENSHOT FEED
     # --------------------------------------------------------
 
-    if (
-        call_score >= 70
-        and call_score > put_score
-    ):
-        signal = "CALL"
-        confidence = call_score
+    if request.files:
 
-    elif (
-        put_score >= 70
-        and put_score > call_score
-    ):
-        signal = "PUT"
-        confidence = put_score
+        uploaded = (
+            request.files.get("image")
+            or request.files.get("file")
+            or request.files.get("screen")
+        )
+
+        if uploaded:
+
+            try:
+                image = Image.open(uploaded.stream)
+
+                width, height = image.size
+
+                state["image_received"] = True
+                state["last_feed"] = time.time()
+                state["feed"] = "LIVE"
+
+                state["analysis"] = (
+                    f"Screen feed active — "
+                    f"{width}x{height} frame received."
+                )
+
+                return jsonify({
+                    "ok": True,
+                    "message": "Screen image accepted",
+                    "width": width,
+                    "height": height,
+                    "state": state
+                })
+
+            except Exception as e:
+
+                return jsonify({
+                    "ok": False,
+                    "error": f"Invalid image: {str(e)}"
+                }), 400
+
+    # --------------------------------------------------------
+    # JSON FEED
+    # --------------------------------------------------------
+
+    data = request.get_json(silent=True)
+
+    if data is None:
+
+        return jsonify({
+            "ok": False,
+            "error": "No JSON data or image received"
+        }), 400
+
+    state["asset"] = str(
+        data.get("asset", state["asset"])
+    )
+
+    state["price"] = num(
+        data.get("price", state["price"])
+    )
+
+    state["candles"] = integer(
+        data.get("candles", state["candles"])
+    )
+
+    state["fractal"] = integer(
+        data.get("fractal", state["fractal"])
+    )
+
+    state["ema9"] = num(
+        data.get("ema9", state["ema9"])
+    )
+
+    state["ema20"] = num(
+        data.get("ema20", state["ema20"])
+    )
+
+    state["ema50"] = num(
+        data.get("ema50", state["ema50"])
+    )
+
+    state["rsi"] = num(
+        data.get("rsi", state["rsi"])
+    )
+
+    state["macd"] = num(
+        data.get("macd", state["macd"])
+    )
+
+    state["cci"] = num(
+        data.get("cci", state["cci"])
+    )
+
+    state["atr"] = num(
+        data.get("atr", state["atr"])
+    )
+
+    state["payout"] = num(
+        data.get("payout", state["payout"])
+    )
+
+    state["expiry"] = integer(
+        data.get("expiry", state["expiry"])
+    )
+
+    state["entry_window"] = integer(
+        data.get(
+            "entry_window",
+            state["entry_window"]
+        )
+    )
+
+    state["entry"] = num(
+        data.get("entry", state["price"])
+    )
+
+    # If the sender provides its own signal/confidence,
+    # preserve it.
+    incoming_signal = str(
+        data.get("signal", "")
+    ).upper()
+
+    incoming_confidence = integer(
+        data.get("confidence", -1)
+    )
+
+    if incoming_signal in ("CALL", "PUT", "WAIT"):
+        state["signal"] = incoming_signal
+
+    if incoming_confidence >= 0:
+        state["confidence"] = max(
+            0,
+            min(incoming_confidence, 100)
+        )
+
+    state["last_feed"] = time.time()
+    state["feed"] = "LIVE"
+    state["image_received"] = False
+
+    # Only calculate when the sender did not provide
+    # a meaningful signal.
+    if not incoming_signal:
+
+        state["signal"] = "WAIT"
+
+        state["analysis"] = calculate_analysis()
 
     else:
-        signal = "WAIT"
-        confidence = abs(
-            call_score - put_score
-        )
 
-    last_price = float(values[-1])
+        if state["signal"] == "CALL":
+            state["analysis"] = (
+                "CALL signal received from live feed."
+            )
 
-    with app.app_context():
+        elif state["signal"] == "PUT":
+            state["analysis"] = (
+                "PUT signal received from live feed."
+            )
 
-        state.update(
-            {
-                "signal": signal,
-                "confidence": int(confidence),
-                "entry": last_price,
+        else:
+            state["analysis"] = (
+                "Live feed active — waiting for confirmation."
+            )
 
-                "analysis": (
-                    f"{signal} setup | "
-                    f"EMA trend + MACD + RSI + CCI"
-                ),
-
-                "ema9": float(ema9),
-                "ema20": float(ema20),
-                "ema50": float(ema50),
-
-                "rsi": float(rsi),
-                "atr": float(atr),
-                "cci": float(cci),
-
-                "macd": float(macd),
-                "macd_signal": float(macd_signal),
-
-                "candles": len(values),
-
-                "feed": "LIVE",
-                "image_received": (
-                    screen_frame["bytes"] is not None
-                ),
-            }
-        )
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-@app.route("/")
-def home():
-    return render_template_string(HTML)
+    return jsonify({
+        "ok": True,
+        "message": "JSON feed accepted",
+        "state": state
+    })
 
 
 # ============================================================
 # STATE API
 # ============================================================
 
-@app.route("/api/state")
+@app.route("/api/state", methods=["GET"])
 def api_state():
 
-    current = dict(state)
-
-    age = time.time() - current["last_feed"]
-
-    if current["last_feed"] == 0:
-        current["feed"] = "DISCONNECTED"
-
-    elif age > 15:
-
-        current["feed"] = "DISCONNECTED"
-
-        current["analysis"] = (
-            "Screen feed stale — "
-            "waiting for new frame"
-        )
-
-    return jsonify(current)
+    return jsonify(state)
 
 
 # ============================================================
-# FEED API
-#
-# Supports:
-#
-# 1. JSON
-# 2. image/jpeg
-# 3. image/png
-# 4. multipart image/file
+# HEALTH
 # ============================================================
 
-@app.route("/api/feed", methods=["POST"])
-def feed():
+@app.route("/api/health", methods=["GET"])
+def health():
 
-    if not auth_ok():
-
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "Unauthorized",
-                }
-            ),
-            401,
-        )
-
-    content_type = (
-        request.content_type
-        or ""
-    )
-
-    # ========================================================
-    # IMAGE FEED
-    # ========================================================
-
-    if (
-        content_type.startswith("image/")
-        or "multipart/form-data"
-        in content_type
-    ):
-
-        data = None
-        mime = "image/jpeg"
-
-        if "multipart/form-data" in content_type:
-
-            file_obj = (
-                request.files.get("image")
-                or request.files.get("file")
-            )
-
-            if file_obj is None:
-
-                try:
-                    file_obj = next(
-                        iter(
-                            request.files.values()
-                        )
-                    )
-                except StopIteration:
-                    file_obj = None
-
-            if file_obj is not None:
-
-                data = file_obj.read()
-
-                if file_obj.mimetype:
-                    mime = file_obj.mimetype
-
-        else:
-
-            data = request.get_data()
-
-            if content_type:
-                mime = content_type
-
-        if not data:
-
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": (
-                            "No image received"
-                        ),
-                    }
-                ),
-                400,
-            )
-
-        # ----------------------------------------------------
-        # Validate and normalize image using PIL.
-        # NO OPENCV / CV2 REQUIRED.
-        # ----------------------------------------------------
-
-        try:
-
-            image = Image.open(
-                io.BytesIO(data)
-            ).convert("RGB")
-
-            image.thumbnail(
-                (1280, 1280)
-            )
-
-            output = io.BytesIO()
-
-            image.save(
-                output,
-                format="JPEG",
-                quality=82,
-                optimize=True,
-            )
-
-            data = output.getvalue()
-
-        except Exception as exc:
-
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": (
-                            "Invalid image: "
-                            + str(exc)
-                        ),
-                    }
-                ),
-                400,
-            )
-
-        # ----------------------------------------------------
-        # Save latest screen frame
-        # ----------------------------------------------------
-
-        screen_frame["bytes"] = data
-        screen_frame["mime"] = "image/jpeg"
-        screen_frame["time"] = time.time()
-
-        state.update(
-            {
-                "feed": "LIVE",
-                "last_feed": time.time(),
-                "image_received": True,
-
-                "analysis": (
-                    "Screen feed LIVE — "
-                    "chart captured"
-                ),
-            }
-        )
-
-        return jsonify(
-            {
-                "ok": True,
-                "message": (
-                    "Screen image accepted"
-                ),
-                "state": dict(state),
-            }
-        )
-
-    # ========================================================
-    # JSON FEED
-    # ========================================================
-
-    body = request.get_json(
-        silent=True
-    )
-
-    if body:
-
-        if "asset" in body:
-            state["asset"] = body["asset"]
-
-        if "price" in body:
-
-            try:
-
-                price = float(
-                    body["price"]
-                )
-
-                state["price"] = price
-
-                prices.append(price)
-
-            except Exception:
-                pass
-
-        if "signal" in body:
-            state["signal"] = body["signal"]
-
-        if "confidence" in body:
-
-            try:
-                state["confidence"] = int(
-                    body["confidence"]
-                )
-            except Exception:
-                pass
-
-        if "entry" in body:
-
-            try:
-                state["entry"] = float(
-                    body["entry"]
-                )
-            except Exception:
-                pass
-
-        if "entry_window" in body:
-
-            try:
-                state["entry_window"] = int(
-                    body["entry_window"]
-                )
-            except Exception:
-                pass
-
-        if "candles" in body:
-
-            try:
-                state["candles"] = int(
-                    body["candles"]
-                )
-            except Exception:
-                pass
-
-        if "payout" in body:
-
-            try:
-                state["payout"] = int(
-                    body["payout"]
-                )
-            except Exception:
-                pass
-
-        state["feed"] = "LIVE"
-        state["last_feed"] = time.time()
-
-        analyze_market()
-
-        return jsonify(
-            {
-                "ok": True,
-                "message": (
-                    "JSON feed accepted"
-                ),
-                "state": dict(state),
-            }
-        )
-
-    # ========================================================
-    # NOTHING RECEIVED
-    # ========================================================
-
-    return (
-        jsonify(
-            {
-                "ok": False,
-                "error": (
-                    "No JSON data or image received"
-                ),
-            }
-        ),
-        400,
-    )
+    return jsonify({
+        "ok": True,
+        "app": "ALUCARD V2",
+        "version": VERSION,
+        "feed": state["feed"],
+        "feed_age": state["feed_age"],
+        "time": state["server_time"]
+    })
 
 
 # ============================================================
-# LATEST SCREEN IMAGE
-# ============================================================
-
-@app.route("/api/screen")
-def screen():
-
-    data = screen_frame["bytes"]
-    mime = screen_frame["mime"]
-
-    if not data:
-
-        return (
-            "No screen frame",
-            404,
-        )
-
-    return (
-        data,
-        200,
-        {
-            "Content-Type": mime,
-            "Cache-Control": "no-store",
-        },
-    )
-
-
-# ============================================================
-# HTML
+# DASHBOARD
 # ============================================================
 
 HTML = r"""
-<!doctype html>
-
+<!DOCTYPE html>
 <html>
-
 <head>
 
 <meta name="viewport"
-content="width=device-width,initial-scale=1">
+      content="width=device-width, initial-scale=1">
 
-<title>ALUCARD</title>
+<title>ALUCARD V2</title>
 
 <style>
 
-body{
-    margin:0;
-    background:#050707;
-    color:#ddd;
-    font-family:Arial,sans-serif;
+* {
+    box-sizing: border-box;
 }
 
-.wrap{
-    max-width:1100px;
-    margin:auto;
-    padding:16px;
+body {
+    margin: 0;
+    background:
+        radial-gradient(circle at top,
+        #202020 0%,
+        #090909 55%,
+        #000000 100%);
+
+    color: #eee;
+    font-family: Arial, sans-serif;
 }
 
-h1{
-    color:#d33;
-    margin:0;
+.header {
+    padding: 18px;
+    text-align: center;
+    border-bottom: 1px solid #444;
 }
 
-.sub{
-    color:#888;
-    margin-top:3px;
+.title {
+    font-size: 30px;
+    font-weight: bold;
+    letter-spacing: 4px;
 }
 
-.top{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:10px;
+.subtitle {
+    color: #aaa;
+    margin-top: 5px;
+    letter-spacing: 2px;
 }
 
-select,
-button{
-    background:#111;
-    color:#eee;
-    border:1px solid #444;
-    padding:10px;
-    border-radius:8px;
+.status {
+    margin-top: 12px;
+    font-weight: bold;
 }
 
-select{
-    min-width:150px;
-}
-
-.live{
-    margin-top:14px;
-    padding:10px;
-    border-radius:8px;
-    background:#111;
-    border:1px solid #333;
-}
-
-.ok{
-    color:#6f6;
-}
-
-.bad{
-    color:#f66;
-}
-
-.grid{
-    display:grid;
+.grid {
+    display: grid;
     grid-template-columns:
-        repeat(4,1fr);
-    gap:10px;
-    margin-top:14px;
+        repeat(auto-fit, minmax(150px, 1fr));
+
+    gap: 10px;
+    padding: 14px;
 }
 
-.card{
-    background:#0d1111;
-    border:1px solid #272d2d;
-    border-radius:10px;
-    padding:12px;
+.card {
+    background: rgba(20,20,20,.9);
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 15px;
+    min-height: 85px;
 }
 
-.big{
-    font-size:26px;
-    font-weight:bold;
-    margin-top:5px;
+.label {
+    color: #999;
+    font-size: 12px;
+    text-transform: uppercase;
 }
 
-.tabs{
-    display:flex;
-    gap:6px;
-    overflow:auto;
-    margin:14px 0;
+.value {
+    font-size: 24px;
+    margin-top: 8px;
+    font-weight: bold;
 }
 
-.tab{
-    white-space:nowrap;
+.signal {
+    font-size: 36px;
 }
 
-.analytics{
-    display:grid;
-    grid-template-columns:
-        repeat(4,1fr);
-    gap:8px;
+.analysis {
+    margin: 14px;
+    padding: 18px;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #111;
 }
 
-.screen{
-    margin-top:14px;
-    background:#000;
-    border:1px solid #333;
-    border-radius:10px;
-    overflow:hidden;
-    text-align:center;
-    min-height:100px;
+.tabs {
+    display: flex;
+    gap: 8px;
+    padding: 14px;
+    overflow-x: auto;
 }
 
-.screen img{
-    max-width:100%;
-    max-height:500px;
-}
-
-.analysis{
-    margin-top:12px;
-}
-
-@media(max-width:700px){
-
-    .grid,
-    .analytics{
-        grid-template-columns:
-            repeat(2,1fr);
-    }
-
+.tab {
+    padding: 10px 18px;
+    border: 1px solid #444;
+    border-radius: 5px;
+    white-space: nowrap;
 }
 
 </style>
@@ -813,552 +549,254 @@ select{
 
 <body>
 
-<div class="wrap">
+<div class="header">
 
-<div class="top">
+    <div class="title">
+        ALUCARD
+    </div>
 
-<div>
+    <div class="subtitle">
+        GOTHIC MARKET INTELLIGENCE
+    </div>
 
-<h1>ALUCARD</h1>
-
-<div class="sub">
-GOTHIC MARKET INTELLIGENCE
-</div>
-
-</div>
-
-<select id="assetMenu">
-
-<option value="Forex">
-Forex
-</option>
-
-<option>
-EUR/USD
-</option>
-
-<option>
-GBP/USD
-</option>
-
-<option>
-USD/JPY
-</option>
-
-<option>
-AUD/USD
-</option>
-
-<option>
-USD/CAD
-</option>
-
-<option>
-USD/CHF
-</option>
-
-<option>
-NZD/USD
-</option>
-
-<option>
-EUR/GBP
-</option>
-
-<option>
-EUR/JPY
-</option>
-
-<option>
-GBP/JPY
-</option>
-
-<option>
-EURUSD OTC
-</option>
-
-<option>
-GBPUSD OTC
-</option>
-
-<option>
-USDJPY OTC
-</option>
-
-<option>
-AUDUSD OTC
-</option>
-
-<option>
-EURJPY OTC
-</option>
-
-<option>
-GBPJPY OTC
-</option>
-
-<option>
-Crypto
-</option>
-
-<option>
-Bitcoin
-</option>
-
-<option>
-Ethereum
-</option>
-
-<option>
-Gold
-</option>
-
-<option>
-Silver
-</option>
-
-<option>
-Oil
-</option>
-
-<option>
-Natural Gas
-</option>
-
-<option>
-Stocks
-</option>
-
-<option>
-Indices
-</option>
-
-</select>
+    <div class="status" id="status">
+        Feed: DISCONNECTED
+    </div>
 
 </div>
 
-
-<div id="live"
-class="live">
-
-Feed: DISCONNECTED
-
+<div class="tabs">
+    <div class="tab">Signals</div>
+    <div class="tab">Trades</div>
+    <div class="tab">Performance</div>
+    <div class="tab">Settings</div>
 </div>
-
 
 <div class="grid">
 
+    <div class="card">
+        <div class="label">Asset</div>
+        <div class="value" id="asset">UNKNOWN</div>
+    </div>
 
-<div class="card">
+    <div class="card">
+        <div class="label">Price</div>
+        <div class="value" id="price">0.000000</div>
+    </div>
 
-Signal
+    <div class="card">
+        <div class="label">Signal</div>
+        <div class="value signal" id="signal">
+            WAIT
+        </div>
+    </div>
 
-<div id="sig"
-class="big">
+    <div class="card">
+        <div class="label">Confidence</div>
+        <div class="value" id="confidence">
+            0%
+        </div>
+    </div>
 
-WAIT
+    <div class="card">
+        <div class="label">Entry</div>
+        <div class="value" id="entry">
+            0.000000
+        </div>
+    </div>
 
-</div>
+    <div class="card">
+        <div class="label">Entry Window</div>
+        <div class="value" id="entry_window">
+            12s
+        </div>
+    </div>
 
-</div>
+    <div class="card">
+        <div class="label">Candles</div>
+        <div class="value" id="candles">
+            0
+        </div>
+    </div>
 
-
-<div class="card">
-
-Price
-
-<div id="price"
-class="big">
-
-0.000000
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-Confidence
-
-<div id="conf"
-class="big">
-
-0%
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-Entry Window
-
-<div id="win"
-class="big">
-
-12s
-
-</div>
+    <div class="card">
+        <div class="label">Fractal</div>
+        <div class="value" id="fractal">
+            2
+        </div>
+    </div>
 
 </div>
 
+<div class="analysis">
+
+    <div class="label">
+        LIVE ANALYSIS
+    </div>
+
+    <div class="value"
+         id="analysis"
+         style="font-size:18px;">
+        Waiting for screen feed...
+    </div>
 
 </div>
 
+<div class="grid">
 
-<div class="tabs">
+    <div class="card">
+        <div class="label">EMA 9</div>
+        <div class="value" id="ema9">0.000000</div>
+    </div>
 
-<button class="tab">
-Signals
-</button>
+    <div class="card">
+        <div class="label">EMA 20</div>
+        <div class="value" id="ema20">0.000000</div>
+    </div>
 
-<button class="tab">
-Trades
-</button>
+    <div class="card">
+        <div class="label">EMA 50</div>
+        <div class="value" id="ema50">0.000000</div>
+    </div>
 
-<button class="tab">
-Performance
-</button>
+    <div class="card">
+        <div class="label">RSI</div>
+        <div class="value" id="rsi">0.00</div>
+    </div>
 
-<button class="tab">
-Settings
-</button>
+    <div class="card">
+        <div class="label">MACD</div>
+        <div class="value" id="macd">0.00</div>
+    </div>
 
-</div>
+    <div class="card">
+        <div class="label">CCI</div>
+        <div class="value" id="cci">0.00</div>
+    </div>
 
-
-<h3>
-Analytics
-</h3>
-
-
-<div class="analytics">
-
-
-<div class="card">
-
-EMA 9
-
-<div id="e9">
-0.000000
-</div>
-
-</div>
-
-
-<div class="card">
-
-EMA 20
-
-<div id="e20">
-0.000000
-</div>
+    <div class="card">
+        <div class="label">ATR</div>
+        <div class="value" id="atr">0.00</div>
+    </div>
 
 </div>
-
-
-<div class="card">
-
-EMA 50
-
-<div id="e50">
-0.000000
-</div>
-
-</div>
-
-
-<div class="card">
-
-RSI
-
-<div id="rsi">
-0.00
-</div>
-
-</div>
-
-
-<div class="card">
-
-ATR
-
-<div id="atr">
-0.000000
-</div>
-
-</div>
-
-
-<div class="card">
-
-CCI
-
-<div id="cci">
-0.00
-</div>
-
-</div>
-
-
-<div class="card">
-
-MACD
-
-<div id="macd">
-0.000000
-</div>
-
-</div>
-
-
-<div class="card">
-
-Fractal
-
-<div>
-2
-</div>
-
-</div>
-
-
-</div>
-
-
-<div class="card analysis">
-
-<b id="analysis">
-Waiting for screen feed...
-</b>
-
-<br>
-
-<small id="candles">
-Candles: 0 | Screen: WAITING
-</small>
-
-</div>
-
-
-<div class="screen">
-
-<img
-id="screen"
-src="/api/screen"
-style="display:none"
-onerror="this.style.display='none'"
->
-
-</div>
-
-
-</div>
-
 
 <script>
 
-async function updateDashboard(){
+async function update() {
 
-    try{
+    try {
 
         const response =
-            await fetch(
-                "/api/state",
-                {
-                    cache:"no-store"
-                }
-            );
+            await fetch("/api/state");
 
         const s =
             await response.json();
 
-
-        document.getElementById(
-            "live"
-        ).textContent =
+        document.getElementById("status")
+            .innerText =
             "Feed: " +
             s.feed +
             "   Asset: " +
-            (s.asset || "UNKNOWN");
+            s.asset;
 
+        document.getElementById("asset")
+            .innerText = s.asset;
 
-        const live =
-            document.getElementById(
-                "live"
-            );
+        document.getElementById("price")
+            .innerText =
+            Number(s.price).toFixed(6);
 
-        if(s.feed === "LIVE"){
+        document.getElementById("signal")
+            .innerText = s.signal;
 
-            live.className =
-                "live ok";
+        document.getElementById("confidence")
+            .innerText =
+            s.confidence + "%";
 
-        }else{
+        document.getElementById("entry")
+            .innerText =
+            Number(s.entry).toFixed(6);
 
-            live.className =
-                "live bad";
+        document.getElementById("entry_window")
+            .innerText =
+            s.entry_window + "s";
 
-        }
+        document.getElementById("candles")
+            .innerText = s.candles;
 
+        document.getElementById("fractal")
+            .innerText = s.fractal;
 
-        document.getElementById(
-            "sig"
-        ).textContent =
-            s.signal || "WAIT";
+        document.getElementById("analysis")
+            .innerText = s.analysis;
 
+        document.getElementById("ema9")
+            .innerText =
+            Number(s.ema9).toFixed(6);
 
-        document.getElementById(
-            "price"
-        ).textContent =
-            Number(
-                s.price || 0
-            ).toFixed(6);
+        document.getElementById("ema20")
+            .innerText =
+            Number(s.ema20).toFixed(6);
 
+        document.getElementById("ema50")
+            .innerText =
+            Number(s.ema50).toFixed(6);
 
-        document.getElementById(
-            "conf"
-        ).textContent =
-            (s.confidence || 0)
-            + "%";
+        document.getElementById("rsi")
+            .innerText =
+            Number(s.rsi).toFixed(2);
 
+        document.getElementById("macd")
+            .innerText =
+            Number(s.macd).toFixed(4);
 
-        document.getElementById(
-            "win"
-        ).textContent =
-            (s.entry_window || 12)
-            + "s";
+        document.getElementById("cci")
+            .innerText =
+            Number(s.cci).toFixed(2);
 
+        document.getElementById("atr")
+            .innerText =
+            Number(s.atr).toFixed(6);
 
-        document.getElementById(
-            "e9"
-        ).textContent =
-            Number(
-                s.ema9 || 0
-            ).toFixed(6);
+    } catch (e) {
 
-
-        document.getElementById(
-            "e20"
-        ).textContent =
-            Number(
-                s.ema20 || 0
-            ).toFixed(6);
-
-
-        document.getElementById(
-            "e50"
-        ).textContent =
-            Number(
-                s.ema50 || 0
-            ).toFixed(6);
-
-
-        document.getElementById(
-            "rsi"
-        ).textContent =
-            Number(
-                s.rsi || 0
-            ).toFixed(2);
-
-
-        document.getElementById(
-            "atr"
-        ).textContent =
-            Number(
-                s.atr || 0
-            ).toFixed(6);
-
-
-        document.getElementById(
-            "cci"
-        ).textContent =
-            Number(
-                s.cci || 0
-            ).toFixed(2);
-
-
-        document.getElementById(
-            "macd"
-        ).textContent =
-            Number(
-                s.macd || 0
-            ).toFixed(6);
-
-
-        document.getElementById(
-            "analysis"
-        ).textContent =
-            s.analysis || "";
-
-
-        document.getElementById(
-            "candles"
-        ).textContent =
-            "Candles: " +
-            (s.candles || 0) +
-            " | Screen: " +
-            (
-                s.image_received
-                ? "LIVE"
-                : "WAITING"
-            );
-
-
-        if(s.image_received){
-
-            const screen =
-                document.getElementById(
-                    "screen"
-                );
-
-            screen.style.display =
-                "block";
-
-            screen.src =
-                "/api/screen?t=" +
-                Date.now();
-        }
-
-    }catch(error){
-
-        console.log(error);
+        document.getElementById("status")
+            .innerText =
+            "Feed: DISCONNECTED";
 
     }
 
 }
 
+setInterval(update, 1000);
 
-setInterval(
-    updateDashboard,
-    2000
-);
-
-updateDashboard();
+update();
 
 </script>
 
 </body>
-
 </html>
 """
 
 
+@app.route("/", methods=["GET"])
+def dashboard():
+
+    return render_template_string(HTML)
+
+
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
+        os.environ.get("PORT", 5000)
     )
 
     app.run(
         host="0.0.0.0",
         port=port
-        )
+    )
