@@ -1,208 +1,54 @@
-import base64
-import io
-import math
-import threading
+import os
 import time
+import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from PIL import Image
-
-
-# ============================================================
-# ALUCARD V2
-# GOTHIC MARKET INTELLIGENCE
-# Render / Flask / Gunicorn
-#
-# Dependencies:
-#   Flask
-#   gunicorn
-#   Pillow
-#   requests
-#
-# NO OPENCV / cv2 REQUIRED
-# ============================================================
 
 app = Flask(__name__)
 
-VERSION = "ALUCARD-V2.5"
+VERSION = "ALUCARD-V2.1"
 
-FEED_TIMEOUT = 20
-ENTRY_WINDOW_SECONDS = 12
-FRACTAL_PERIOD = 2
-
-
-# ============================================================
-# CURRENCY / ASSET DATABASE
-# ============================================================
-
-CURRENCIES = [
-    # Major Forex
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "AUDUSD",
-    "USDCAD",
-    "NZDUSD",
-
-    # Forex Crosses
-    "EURGBP",
-    "EURJPY",
-    "EURCHF",
-    "EURAUD",
-    "EURCAD",
-    "EURNZD",
-    "GBPJPY",
-    "GBPCHF",
-    "GBPAUD",
-    "GBPCAD",
-    "GBPNZD",
-    "AUDJPY",
-    "AUDCAD",
-    "AUDCHF",
-    "AUDNZD",
-    "CADJPY",
-    "CADCHF",
-    "CHFJPY",
-    "NZDJPY",
-    "NZDCAD",
-
-    # OTC
-    "EURUSD_otc",
-    "GBPUSD_otc",
-    "USDJPY_otc",
-    "USDCHF_otc",
-    "AUDUSD_otc",
-    "USDCAD_otc",
-    "NZDUSD_otc",
-    "EURGBP_otc",
-    "EURJPY_otc",
-    "GBPJPY_otc",
-    "AUDJPY_otc",
-    "CADJPY_otc",
-
-    # Crypto
-    "BTCUSD",
-    "BTCUSD_otc",
-    "ETHUSD",
-    "ETHUSD_otc",
-    "LTCUSD",
-    "LTCUSD_otc",
-    "XRPUSD",
-    "XRPUSD_otc",
-    "DOGEUSD",
-    "DOGEUSD_otc",
-
-    # Commodities
-    "XAUUSD",
-    "XAUUSD_otc",
-    "XAGUSD",
-    "XAGUSD_otc",
-    "USOIL",
-    "USOIL_otc",
-    "UKOIL",
-    "UKOIL_otc",
-    "NATURALGAS",
-    "NATURALGAS_otc",
-
-    # Stocks
-    "AAPL",
-    "AAPL_otc",
-    "TSLA",
-    "TSLA_otc",
-    "AMZN",
-    "AMZN_otc",
-    "MSFT",
-    "MSFT_otc",
-    "GOOGL",
-    "GOOGL_otc",
-    "META",
-    "META_otc",
-    "NVDA",
-    "NVDA_otc",
-
-    # Indices
-    "SP500",
-    "SP500_otc",
-    "NASDAQ",
-    "NASDAQ_otc",
-    "DOW",
-    "DOW_otc",
-    "DAX",
-    "DAX_otc",
-    "FTSE",
-    "FTSE_otc",
-    "CAC40",
-    "CAC40_otc",
-    "NIKKEI",
-    "NIKKEI_otc",
+ASSETS = [
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
+    "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CHFJPY",
+    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "USDCHF_otc", "AUDUSD_otc",
+    "USDCAD_otc", "NZDUSD_otc", "EURGBP_otc", "EURJPY_otc", "GBPJPY_otc",
+    "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "BTCUSD_otc", "ETHUSD_otc",
+    "LTCUSD_otc", "XRPUSD_otc", "GOLD", "SILVER", "OIL", "NATGAS",
+    "AAPL", "TSLA", "AMZN", "MSFT", "GOOGL", "META", "NASDAQ", "SP500",
+    "DOWJONES"
 ]
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-STATE_LOCK = threading.Lock()
 
 STATE = {
     "version": VERSION,
-
     "feed": "DISCONNECTED",
-    "feed_health": "OFFLINE",
+    "feed_health": "WAITING",
+    "image_received": False,
     "last_feed": 0.0,
-    "last_feed_time": None,
-
     "asset": "UNKNOWN",
     "price": 0.0,
-
     "signal": "WAIT",
     "confidence": 0,
-
     "entry": 0.0,
-    "entry_window": ENTRY_WINDOW_SECONDS,
-
+    "entry_window": 12,
     "candles": 0,
-
-    "fractal": FRACTAL_PERIOD,
-
+    "fractal": 2,
     "ema9": 0.0,
     "ema20": 0.0,
     "ema50": 0.0,
-
     "rsi": 0.0,
-    "atr": 0.0,
     "cci": 0.0,
-    "macd": 0.0,
-    "macd_signal": 0.0,
-
+    "atr": 0.0,
     "analysis": "Waiting for screen feed...",
-
-    "image_received": False,
-    "image_size": 0,
-
-    "selected_currency": "EURUSD_otc",
-
     "payout": 0,
-
-    "scan_count": 0,
-    "signal_count": 0,
-
-    "wins": 0,
-    "losses": 0,
-
-    "updated": None,
+    "expiry": "5m",
+    "timestamp": "",
+    "error": ""
 }
 
-
-# ============================================================
-# CANDLE / PRICE STORAGE
-# ============================================================
-
-PRICE_HISTORY = []
-
-MAX_PRICES = 250
+LOCK = threading.Lock()
 
 
 def now_iso():
@@ -211,316 +57,640 @@ def now_iso():
 
 def safe_float(value, default=0.0):
     try:
-        if value is None:
-            return default
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema(values, period):
-    if not values:
-        return 0.0
-
-    if len(values) < period:
-        return sum(values) / len(values)
-
-    multiplier = 2.0 / (period + 1.0)
-
-    result = sum(values[:period]) / period
-
-    for value in values[period:]:
-        result = (value - result) * multiplier + result
-
-    return result
-
-
-def calculate_rsi(values, period=14):
-    if len(values) < 2:
-        return 0.0
-
-    data = values[-(period + 1):]
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(data)):
-        change = data[i] - data[i - 1]
-
-        if change > 0:
-            gains.append(change)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(change))
-
-    if not gains:
-        return 50.0
-
-    avg_gain = sum(gains) / len(gains)
-    avg_loss = sum(losses) / len(losses)
-
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-
-    rs = avg_gain / avg_loss
-
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def calculate_atr(values, period=14):
-    if len(values) < 2:
-        return 0.0
-
-    changes = []
-
-    for i in range(1, len(values)):
-        changes.append(abs(values[i] - values[i - 1]))
-
-    recent = changes[-period:]
-
-    if not recent:
-        return 0.0
-
-    return sum(recent) / len(recent)
-
-
-def calculate_cci(values, period=20):
-    if len(values) < 2:
-        return 0.0
-
-    recent = values[-period:]
-
-    if not recent:
-        return 0.0
-
-    mean = sum(recent) / len(recent)
-
-    deviation = sum(abs(x - mean) for x in recent) / len(recent)
-
-    if deviation == 0:
-        return 0.0
-
-    current = recent[-1]
-
-    return (current - mean) / (0.015 * deviation)
-
-
-def calculate_macd(values):
-    if len(values) < 5:
-        return 0.0, 0.0
-
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    macd_value = fast - slow
-
-    # Small-history approximation for signal line.
-    macd_values = []
-
-    start = max(0, len(values) - 35)
-
-    for i in range(start, len(values)):
-        subset = values[:i + 1]
-
-        if len(subset) < 3:
-            continue
-
-        macd_values.append(
-            ema(subset, 12) - ema(subset, 26)
-        )
-
-    if not macd_values:
-        signal = macd_value
-    else:
-        signal = ema(macd_values, 9)
-
-    return macd_value, signal
-
-
-def fractal_direction(values, period=2):
-    """
-    Simple fractal-style price structure.
-
-    Positive = bullish structure
-    Negative = bearish structure
-    Zero = neutral
-    """
-
-    needed = period * 2 + 1
-
-    if len(values) < needed:
-        return 0
-
-    center = len(values) - period - 1
-
-    if center < period:
-        return 0
-
-    current = values[center]
-
-    left = values[center - period:center]
-    right = values[center + 1:center + period + 1]
-
-    if current > max(left) and current > max(right):
-        return 1
-
-    if current < min(left) and current < min(right):
-        return -1
-
-    return 0
-
-
-# ============================================================
-# ANALYSIS ENGINE
-# ============================================================
-
-def analyze_prices(values):
-    if len(values) < 5:
-        return {
-            "signal": "WAIT",
-            "confidence": 0,
-            "analysis": "Collecting market data...",
-            "ema9": ema(values, 9),
-            "ema20": ema(values, 20),
-            "ema50": ema(values, 50),
-            "rsi": calculate_rsi(values),
-            "atr": calculate_atr(values),
-            "cci": calculate_cci(values),
-            "macd": 0.0,
-            "macd_signal": 0.0,
-            "fractal": 0,
-        }
-
-    ema9_value = ema(values, 9)
-    ema20_value = ema(values, 20)
-    ema50_value = ema(values, 50)
-
-    rsi_value = calculate_rsi(values)
-    atr_value = calculate_atr(values)
-    cci_value = calculate_cci(values)
-
-    macd_value, macd_signal_value = calculate_macd(values)
-
-    fractal = fractal_direction(
-        values,
-        FRACTAL_PERIOD
-    )
-
-    score = 0
-    reasons = []
-
-    # EMA trend
-    if ema9_value > ema20_value:
-        score += 2
-        reasons.append("EMA9 above EMA20")
-    elif ema9_value < ema20_value:
-        score -= 2
-        reasons.append("EMA9 below EMA20")
-
-    if ema20_value > ema50_value:
-        score += 2
-        reasons.append("EMA20 above EMA50")
-    elif ema20_value < ema50_value:
-        score -= 2
-        reasons.append("EMA20 below EMA50")
-
-    # RSI
-    if rsi_value >= 55:
-        score += 1
-        reasons.append("RSI bullish")
-    elif rsi_value <= 45:
-        score -= 1
-        reasons.append("RSI bearish")
-
-    # CCI
-    if cci_value > 50:
-        score += 1
-        reasons.append("CCI bullish")
-    elif cci_value < -50:
-        score -= 1
-        reasons.append("CCI bearish")
-
-    # MACD
-    if macd_value > macd_signal_value:
-        score += 1
-        reasons.append("MACD bullish")
-    elif macd_value < macd_signal_value:
-        score -= 1
-        reasons.append("MACD bearish")
-
-    # Fractal
-    if fractal > 0:
-        score += 1
-        reasons.append("Fractal bullish")
-    elif fractal < 0:
-        score -= 1
-        reasons.append("Fractal bearish")
-
-    # Confidence is based on indicator agreement.
-    strength = abs(score)
-
-    confidence = int(
-        clamp(
-            50 + (strength * 7),
-            0,
-            96
-        )
-    )
-
-    # Require meaningful agreement.
-    if score >= 5:
-        signal = "CALL"
-    elif score <= -5:
-        signal = "PUT"
-    else:
-        signal = "WAIT"
-
-    if signal == "WAIT":
-        confidence = min(confidence, 69)
-
-    if signal == "CALL":
-        analysis = "BULLISH — " + ", ".join(reasons[-4:])
-
-    elif signal == "PUT":
-        analysis = "BEARISH — " + ", ".join(reasons[-4:])
-
-    else:
-        analysis = "WAIT — indicators are not sufficiently aligned."
-
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "analysis": analysis,
-
-        "ema9": ema9_value,
-        "ema20": ema20_value,
-        "ema50": ema50_value,
-
-        "rsi": rsi_value,
-        "atr": atr_value,
-        "cci": cci_value,
-
-        "macd": macd_value,
-        "macd_signal": macd_signal_value,
-
-        "fractal": fractal,
-    }
-
-
-# ============================================================
-# FEED MANAGEMENT
-# ============================================================
-
-def mark_feed_live():
-    with STATE_LOCK:
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def update_state(data):
+    with LOCK:
+        for key in (
+            "asset", "signal", "analysis", "expiry", "feed",
+            "feed_health", "error"
+        ):
+            if key in data and data[key] is not None:
+                STATE[key] = str(data[key])
+
+        for key in (
+            "price", "entry", "ema9", "ema20", "ema50",
+            "rsi", "cci", "atr", "payout"
+        ):
+            if key in data:
+                STATE[key] = safe_float(data[key], STATE[key])
+
+        for key in ("confidence", "entry_window", "candles", "fractal"):
+            if key in data:
+                STATE[key] = safe_int(data[key], STATE[key])
+
+        STATE["last_feed"] = time.time()
+        STATE["timestamp"] = now_iso()
         STATE["feed"] = "LIVE"
-        STATE["feed
+        STATE["feed_health"] = "CONNECTED"
+        STATE["error"] = ""
+
+
+def feed_watchdog():
+    while True:
+        time.sleep(3)
+
+        with LOCK:
+            age = time.time() - STATE["last_feed"]
+
+            if STATE["last_feed"] and age > 15:
+                STATE["feed"] = "DISCONNECTED"
+                STATE["feed_health"] = "STALE"
+                STATE["signal"] = "WAIT"
+                STATE["confidence"] = 0
+                STATE["analysis"] = (
+                    "Screen feed is stale. Waiting for new frame."
+                )
+
+
+threading.Thread(target=feed_watchdog, daemon=True).start()
+
+
+@app.get("/")
+def home():
+    return render_template_string(HTML)
+
+
+@app.get("/api/state")
+def api_state():
+    with LOCK:
+        result = dict(STATE)
+
+        if STATE["last_feed"]:
+            result["feed_age"] = round(
+                time.time() - STATE["last_feed"], 1
+            )
+        else:
+            result["feed_age"] = None
+
+    return jsonify(result)
+
+
+@app.get("/api/assets")
+def api_assets():
+    return jsonify({"assets": ASSETS})
+
+
+@app.post("/api/feed")
+def api_feed():
+    token = (
+        os.environ.get("RYU_FEED_TOKEN")
+        or os.environ.get("ALUCARD_FEED_TOKEN")
+    )
+
+    supplied = (
+        request.headers.get("X-RYU-TOKEN")
+        or request.headers.get("X-ALUCARD-TOKEN")
+    )
+
+    if token and supplied != token:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
+
+    if request.is_json:
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({
+                "ok": False,
+                "error": "Invalid JSON"
+            }), 400
+
+        update_state(data)
+
+        with LOCK:
+            STATE["image_received"] = False
+            result = dict(STATE)
+
+        return jsonify({
+            "ok": True,
+            "message": "JSON feed accepted",
+            "state": result
+        })
+
+    image_file = (
+        request.files.get("image")
+        or request.files.get("file")
+        or request.files.get("frame")
+    )
+
+    if image_file:
+        try:
+            image = Image.open(image_file.stream)
+            image.verify()
+        except Exception:
+            return jsonify({
+                "ok": False,
+                "error": "Invalid image"
+            }), 400
+
+        data = {}
+
+        for key in (
+            "asset",
+            "price",
+            "signal",
+            "confidence",
+            "entry",
+            "entry_window",
+            "candles"
+        ):
+            if key in request.form:
+                data[key] = request.form.get(key)
+
+        update_state(data)
+
+        with LOCK:
+            STATE["image_received"] = True
+            STATE["analysis"] = (
+                "Screen frame received. Analysis data "
+                "awaiting/using supplied values."
+            )
+            result = dict(STATE)
+
+        return jsonify({
+            "ok": True,
+            "message": "Screen frame accepted",
+            "state": result
+        })
+
+    return jsonify({
+        "ok": False,
+        "error": "No JSON data or image received"
+    }), 400
+
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "version": VERSION
+    })
+
+
+HTML = r"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+
+<title>ALUCARD V2</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #050805;
+    color: #eee;
+    font-family: Arial, sans-serif;
+}
+
+header {
+    padding: 18px;
+    text-align: center;
+    border-bottom: 1px solid #243024;
+}
+
+h1 {
+    margin: 0;
+    font-size: 28px;
+    letter-spacing: 4px;
+}
+
+.sub {
+    color: #888;
+    margin-top: 5px;
+    font-size: 12px;
+}
+
+nav {
+    display: flex;
+    overflow: auto;
+    border-bottom: 1px solid #222;
+}
+
+nav button {
+    flex: 1;
+    min-width: 100px;
+    background: #0b100b;
+    color: #aaa;
+    border: 0;
+    padding: 14px;
+    font-weight: bold;
+}
+
+nav button.active {
+    color: #fff;
+    background: #151d15;
+}
+
+main {
+    padding: 14px;
+    max-width: 1100px;
+    margin: auto;
+}
+
+.status {
+    padding: 12px;
+    border: 1px solid #303a30;
+    border-radius: 10px;
+    margin-bottom: 12px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+}
+
+.card {
+    background: #0b100b;
+    border: 1px solid #273127;
+    border-radius: 12px;
+    padding: 14px;
+}
+
+.label {
+    color: #777;
+    font-size: 11px;
+    text-transform: uppercase;
+}
+
+.value {
+    font-size: 24px;
+    margin-top: 6px;
+}
+
+select {
+    width: 100%;
+    padding: 12px;
+    background: #101610;
+    color: #fff;
+    border: 1px solid #344034;
+    border-radius: 8px;
+}
+
+.signal {
+    font-size: 36px;
+    font-weight: bold;
+    text-align: center;
+    padding: 20px;
+}
+
+.wait {
+    color: #aaa;
+}
+
+.call {
+    color: #69e69a;
+}
+
+.put {
+    color: #ff7777;
+}
+
+.small {
+    font-size: 12px;
+    color: #888;
+}
+
+@media (min-width: 700px) {
+    .grid {
+        grid-template-columns: repeat(4, 1fr);
+    }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <h1>ALUCARD</h1>
+    <div class="sub">
+        GOTHIC MARKET INTELLIGENCE — V2.1
+    </div>
+</header>
+
+<nav>
+    <button class="active">Signals</button>
+    <button>Trades</button>
+    <button>Performance</button>
+    <button>Settings</button>
+</nav>
+
+<main>
+
+<div class="status">
+    <b>Feed:</b>
+    <span id="feed">DISCONNECTED</span>
+
+    &nbsp; | &nbsp;
+
+    <b>Asset:</b>
+    <span id="asset">UNKNOWN</span>
+
+    <div class="small" id="health">
+        Waiting for screen feed...
+    </div>
+</div>
+
+<div class="card" style="margin-bottom:10px">
+    <div class="label">Currency / Asset</div>
+
+    <select id="assetSelect"></select>
+</div>
+
+<div class="grid">
+
+<div class="card">
+    <div class="label">Signal</div>
+    <div id="signal" class="signal wait">WAIT</div>
+</div>
+
+<div class="card">
+    <div class="label">Price</div>
+    <div id="price" class="value">0.000000</div>
+</div>
+
+<div class="card">
+    <div class="label">Confidence</div>
+    <div id="confidence" class="value">0%</div>
+</div>
+
+<div class="card">
+    <div class="label">Entry</div>
+    <div id="entry" class="value">0.000000</div>
+</div>
+
+<div class="card">
+    <div class="label">Entry Window</div>
+    <div id="window" class="value">12s</div>
+</div>
+
+<div class="card">
+    <div class="label">Candles</div>
+    <div id="candles" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">Fractal</div>
+    <div id="fractal" class="value">2</div>
+</div>
+
+<div class="card">
+    <div class="label">Expiry</div>
+    <div id="expiry" class="value">5m</div>
+</div>
+
+<div class="card">
+    <div class="label">EMA 9</div>
+    <div id="ema9" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">EMA 20</div>
+    <div id="ema20" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">EMA 50</div>
+    <div id="ema50" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">RSI</div>
+    <div id="rsi" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">CCI</div>
+    <div id="cci" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">ATR</div>
+    <div id="atr" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">Payout</div>
+    <div id="payout" class="value">0%</div>
+</div>
+
+<div class="card">
+    <div class="label">Analysis</div>
+
+    <div id="analysis"
+         class="small"
+         style="font-size:15px;margin-top:8px">
+        Waiting for screen feed...
+    </div>
+</div>
+
+</div>
+</main>
+
+<script>
+
+function put(id, value) {
+    const el = document.getElementById(id);
+
+    if (el) {
+        el.textContent = value;
+    }
+}
+
+
+async function loadAssets() {
+    try {
+        const response = await fetch("/api/assets");
+        const data = await response.json();
+
+        const select = document.getElementById("assetSelect");
+
+        select.innerHTML = "";
+
+        data.assets.forEach(function(asset) {
+            const option = document.createElement("option");
+
+            option.value = asset;
+            option.textContent = asset;
+
+            select.appendChild(option);
+        });
+
+    } catch (error) {
+        console.log("Asset list error:", error);
+    }
+}
+
+
+async function refresh() {
+
+    try {
+
+        const response = await fetch(
+            "/api/state",
+            {cache: "no-store"}
+        );
+
+        const data = await response.json();
+
+        put(
+            "feed",
+            data.feed || "DISCONNECTED"
+        );
+
+        put(
+            "asset",
+            data.asset || "UNKNOWN"
+        );
+
+        put(
+            "price",
+            Number(data.price || 0).toFixed(6)
+        );
+
+        put(
+            "confidence",
+            Math.round(data.confidence || 0) + "%"
+        );
+
+        put(
+            "entry",
+            Number(data.entry || 0).toFixed(6)
+        );
+
+        put(
+            "window",
+            (data.entry_window || 12) + "s"
+        );
+
+        put(
+            "candles",
+            data.candles || 0
+        );
+
+        put(
+            "fractal",
+            data.fractal || 2
+        );
+
+        put(
+            "expiry",
+            data.expiry || "5m"
+        );
+
+        put(
+            "ema9",
+            Number(data.ema9 || 0).toFixed(6)
+        );
+
+        put(
+            "ema20",
+            Number(data.ema20 || 0).toFixed(6)
+        );
+
+        put(
+            "ema50",
+            Number(data.ema50 || 0).toFixed(6)
+        );
+
+        put(
+            "rsi",
+            Number(data.rsi || 0).toFixed(2)
+        );
+
+        put(
+            "cci",
+            Number(data.cci || 0).toFixed(2)
+        );
+
+        put(
+            "atr",
+            Number(data.atr || 0).toFixed(6)
+        );
+
+        put(
+            "payout",
+            Math.round(data.payout || 0) + "%"
+        );
+
+        put(
+            "analysis",
+            data.analysis ||
+            "Waiting for screen feed..."
+        );
+
+        const signal =
+            document.getElementById("signal");
+
+        signal.textContent =
+            data.signal || "WAIT";
+
+        signal.className =
+            "signal " +
+            String(data.signal || "WAIT").toLowerCase();
+
+        const age =
+            data.feed_age === null
+                ? "none"
+                : data.feed_age + "s ago";
+
+        put(
+            "health",
+            (data.feed_health || "WAITING") +
+            " — last frame: " +
+            age
+        );
+
+        const assetSelect =
+            document.getElementById("assetSelect");
+
+        assetSelect.value =
+            data.asset || "UNKNOWN";
+
+    } catch (error) {
+
+        put(
+            "health",
+            "Dashboard connection error"
+        );
+    }
+}
+
+
+loadAssets();
+refresh();
+
+setInterval(refresh, 2000);
+
+</script>
+
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000"))
+    )
