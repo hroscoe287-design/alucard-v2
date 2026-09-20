@@ -1,10 +1,17 @@
 from flask import Flask, request, jsonify, Response
-from PIL import Image
+from PIL import Image, ImageStat, ImageFilter
 from io import BytesIO
 from datetime import datetime, timezone
 import threading
+import base64
+import re
+import time
 
 app = Flask(__name__)
+
+# Allow normal Pocket Option screenshots.
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+
 lock = threading.Lock()
 
 ASSETS = [
@@ -59,12 +66,21 @@ state = {
     "last_frame": None,
     "frames": 0,
 
+    "frame_width": 0,
+    "frame_height": 0,
+    "frame_bytes": 0,
+
+    "visual_brightness": 0.0,
+    "visual_edges": 0.0,
+
     "trades": 0,
     "wins": 0,
     "losses": 0,
 
     "last_error": ""
 }
+
+latest_image = None
 
 
 def utc_now():
@@ -76,10 +92,6 @@ def timestamp():
 
 
 def validate_image(data):
-    """
-    Verify that the received bytes are actually an image.
-    This is the critical fix for /api/frame.
-    """
     try:
         image = Image.open(BytesIO(data))
         image.load()
@@ -95,19 +107,68 @@ def validate_image(data):
         if width < 10 or height < 10:
             raise ValueError("Image dimensions are too small")
 
-        return image_format, width, height
+        return image_format, width, height, image
 
     except Exception as exc:
         raise ValueError(str(exc))
 
 
-def mark_frame_live():
+def visual_analysis(image):
+    """
+    Basic image health analysis.
+
+    This does NOT pretend to calculate financial indicators
+    from pixels. It verifies that a real screen/chart image
+    is arriving and measures visual activity.
+    """
+
+    try:
+        rgb = image.convert("RGB")
+
+        small = rgb.resize((160, 160))
+
+        stat = ImageStat.Stat(small)
+        brightness = sum(stat.mean) / 3.0
+
+        gray = small.convert("L")
+
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edge_stat = ImageStat.Stat(edges)
+
+        edge_value = edge_stat.mean[0]
+
+        return round(brightness, 2), round(edge_value, 2)
+
+    except Exception:
+        return 0.0, 0.0
+
+
+def mark_frame_live(data, image):
+    global latest_image
+
+    brightness, edges = visual_analysis(image)
+
     with lock:
+        latest_image = bytes(data)
+
         state["feed"] = "LIVE"
         state["image_received"] = True
         state["last_frame"] = timestamp()
         state["frames"] += 1
+
+        state["frame_width"] = image.width
+        state["frame_height"] = image.height
+        state["frame_bytes"] = len(data)
+
+        state["visual_brightness"] = brightness
+        state["visual_edges"] = edges
+
         state["last_error"] = ""
+
+        state["analysis"] = (
+            "Pocket Option screen captured successfully. "
+            "Waiting for readable market values..."
+        )
 
 
 def get_state():
@@ -123,23 +184,164 @@ def get_state():
 
             age = (utc_now() - last).total_seconds()
 
+            result["frame_age"] = round(age, 1)
+
             if age > 20:
-                result["feed"] = "DISCONNECTED"
+                result["feed"] = "STALE"
+
+                if result["image_received"]:
+                    result["analysis"] = (
+                        "Screen feed is stale. "
+                        "Waiting for a new Pocket Option frame..."
+                    )
+
+            else:
+                result["feed"] = "LIVE"
 
         except (TypeError, ValueError):
             result["feed"] = "DISCONNECTED"
+            result["frame_age"] = -1
+
+    else:
+        result["frame_age"] = -1
 
     return result
+
+
+def normalize_asset(value):
+    if not value:
+        return None
+
+    raw = str(value).strip().upper()
+
+    raw = raw.replace(" ", "")
+    raw = raw.replace("/", "")
+
+    for asset in ASSETS:
+
+        a = asset.upper().replace("/", "")
+
+        if raw == a:
+            return asset
+
+        if raw == a.replace("_OTC", "OTC"):
+            return asset
+
+    return None
+
+
+def parse_price(text):
+    if not text:
+        return None
+
+    cleaned = text.replace(",", "")
+
+    candidates = re.findall(
+        r"\b\d{1,6}(?:\.\d{1,8})?\b",
+        cleaned
+    )
+
+    values = []
+
+    for item in candidates:
+        try:
+            number = float(item)
+
+            if number > 0:
+                values.append(number)
+
+        except ValueError:
+            pass
+
+    if not values:
+        return None
+
+    # Ignore obvious UI numbers.
+    filtered = [
+        x for x in values
+        if x not in (0, 1, 5, 10, 12, 20, 30, 50, 60, 100, 300)
+    ]
+
+    if filtered:
+        return filtered[0]
+
+    return values[0]
+
+
+def update_from_ocr(text):
+    """
+    Receives OCR text from the dashboard browser.
+
+    The browser performs OCR because the Render service should
+    not require a system-level Tesseract installation.
+    """
+
+    if not text:
+        return
+
+    text = str(text)
+
+    found_asset = None
+
+    upper = text.upper().replace("/", "")
+
+    for asset in ASSETS:
+
+        normal = asset.upper().replace("/", "")
+
+        if normal in upper:
+            found_asset = asset
+            break
+
+        if normal.replace("_OTC", "OTC") in upper:
+            found_asset = asset
+            break
+
+    found_price = parse_price(text)
+
+    with lock:
+
+        if found_asset:
+            state["asset"] = found_asset
+
+        if found_price is not None:
+            state["price"] = found_price
+
+            if state["entry"] == 0:
+                state["entry"] = found_price
+
+        if found_asset or found_price is not None:
+
+            state["analysis"] = (
+                "Screen feed LIVE. "
+                "Market text detected from Pocket Option."
+            )
+
+        else:
+
+            state["analysis"] = (
+                "Screen feed LIVE. "
+                "Chart captured, but readable market text "
+                "was not detected yet."
+            )
+
+        state["last_error"] = ""
 
 
 HTML = """<!doctype html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
 
 <title>ALUCARD V2.1</title>
 
 <style>
+
+* {
+    box-sizing: border-box;
+}
 
 body {
     margin: 0;
@@ -208,6 +410,10 @@ main {
     color: #ff7180;
 }
 
+.warn {
+    color: #ffd36e;
+}
+
 .grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -232,7 +438,6 @@ main {
 
 select {
     width: 100%;
-    box-sizing: border-box;
     padding: 12px;
     background: #17131b;
     color: #eeeeee;
@@ -253,48 +458,95 @@ select {
     font-size: 13px;
 }
 
+.screen-card {
+    margin-top: 10px;
+}
+
+#screen {
+    width: 100%;
+    max-height: 600px;
+    object-fit: contain;
+    background: #000;
+    border-radius: 6px;
+    display: none;
+}
+
+.capture-info {
+    margin-top: 8px;
+    color: #aaa;
+    font-size: 12px;
+}
+
 @media(max-width:700px) {
+
     .grid {
         grid-template-columns: repeat(2, 1fr);
+    }
+
+    .value {
+        font-size: 21px;
     }
 }
 
 </style>
+
+<!-- Browser-side OCR.
+     This lets the Render server remain Python/Pillow only. -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
 </head>
 
 <body>
 
 <header>
-    <h1>ALUCARD</h1>
-    <div class="sub">
-        GOTHIC MARKET INTELLIGENCE — V2.1
-    </div>
+
+<h1>ALUCARD</h1>
+
+<div class="sub">
+GOTHIC MARKET INTELLIGENCE — V2.1
+</div>
+
 </header>
 
+
 <nav>
-    <button onclick="showTab('signals')">Signals</button>
-    <button onclick="showTab('trades')">Trades</button>
-    <button onclick="showTab('performance')">Performance</button>
-    <button onclick="showTab('settings')">Settings</button>
+
+<button onclick="showTab('signals')">
+Signals
+</button>
+
+<button onclick="showTab('trades')">
+Trades
+</button>
+
+<button onclick="showTab('performance')">
+Performance
+</button>
+
+<button onclick="showTab('settings')">
+Settings
+</button>
+
 </nav>
+
 
 <main>
 
 <div class="status">
 
-    Feed:
-    <b id="feed">DISCONNECTED</b>
+Feed:
+<b id="feed" class="dead">DISCONNECTED</b>
 
-    &nbsp; | &nbsp;
+&nbsp; | &nbsp;
 
-    Asset:
-    <b id="assetTop">UNKNOWN</b>
+Asset:
+<b id="assetTop">UNKNOWN</b>
 
-    <br>
+<br>
 
-    <span class="small" id="last">
-        Waiting for Pocket Option screen feed...
-    </span>
+<span class="small" id="last">
+Waiting for Pocket Option screen feed...
+</span>
 
 </div>
 
@@ -303,11 +555,11 @@ select {
 
 <div class="card" style="margin-bottom:10px">
 
-    <div class="label">
-        Currency / Asset
-    </div>
+<div class="label">
+Currency / Asset
+</div>
 
-    <select id="assetSel"></select>
+<select id="assetSel"></select>
 
 </div>
 
@@ -315,546 +567,81 @@ select {
 <div class="grid">
 
 <div class="card">
-    <div class="label">Signal</div>
-    <div class="value signal" id="signal">WAIT</div>
+<div class="label">Signal</div>
+<div class="value signal" id="signal">
+WAIT
+</div>
 </div>
 
 <div class="card">
-    <div class="label">Price</div>
-    <div class="value" id="price">0.000000</div>
+<div class="label">Price</div>
+<div class="value" id="price">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">Confidence</div>
-    <div class="value" id="confidence">0%</div>
+<div class="label">Confidence</div>
+<div class="value" id="confidence">
+0%
+</div>
 </div>
 
 <div class="card">
-    <div class="label">Entry</div>
-    <div class="value" id="entry">0.000000</div>
+<div class="label">Entry</div>
+<div class="value" id="entry">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">Entry Window</div>
-    <div class="value" id="window">12s</div>
+<div class="label">Entry Window</div>
+<div class="value" id="window">
+12s
+</div>
 </div>
 
 <div class="card">
-    <div class="label">Candles</div>
-    <div class="value" id="candles">0</div>
+<div class="label">Candles</div>
+<div class="value" id="candles">
+0
+</div>
 </div>
 
 <div class="card">
-    <div class="label">EMA 9</div>
-    <div class="value" id="ema9">0.000000</div>
+<div class="label">EMA 9</div>
+<div class="value" id="ema9">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">EMA 20</div>
-    <div class="value" id="ema20">0.000000</div>
+<div class="label">EMA 20</div>
+<div class="value" id="ema20">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">EMA 50</div>
-    <div class="value" id="ema50">0.000000</div>
+<div class="label">EMA 50</div>
+<div class="value" id="ema50">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">RSI</div>
-    <div class="value" id="rsi">0.00</div>
+<div class="label">RSI</div>
+<div class="value" id="rsi">
+0.00
+</div>
 </div>
 
 <div class="card">
-    <div class="label">ATR</div>
-    <div class="value" id="atr">0.000000</div>
+<div class="label">ATR</div>
+<div class="value" id="atr">
+0.000000
+</div>
 </div>
 
 <div class="card">
-    <div class="label">CCI</div>
-    <div class="value" id="cci">0.00</div>
-</div>
-
-</div>
-
-
-<div class="card" style="margin-top:10px">
-
-    <div class="label">
-        Analysis
-    </div>
-
-    <div id="analysis">
-        Waiting for Pocket Option screen feed...
-    </div>
-
-</div>
-
-</section>
-
-
-<section id="trades" class="panel">
-
-<div class="card">
-
-    <div class="value" id="tradeStats">
-        Trades: 0 | Wins: 0 | Losses: 0
-    </div>
-
-</div>
-
-</section>
-
-
-<section id="performance" class="panel">
-
-<div class="card">
-
-    <div class="value" id="perf">
-        No completed trades.
-    </div>
-
-</div>
-
-</section>
-
-
-<section id="settings" class="panel">
-
-<div class="card">
-
-    <div class="small">
-
-        Signal threshold: 78%
-        &nbsp; | &nbsp;
-        Entry window: 12s
-        &nbsp; | &nbsp;
-        Expiry: 300s
-
-    </div>
-
-</div>
-
-</section>
-
-</main>
-
-
-<script>
-
-const assets = __ASSETS__;
-
-document.getElementById("assetSel").innerHTML =
-    assets.map(function(asset) {
-        return "<option>" + asset + "</option>";
-    }).join("");
-
-
-function showTab(id) {
-
-    document
-        .querySelectorAll(".panel")
-        .forEach(function(panel) {
-            panel.classList.remove("active");
-        });
-
-    document
-        .getElementById(id)
-        .classList.add("active");
-}
-
-
-function put(id, value) {
-    document.getElementById(id).textContent = value;
-}
-
-
-async function refresh() {
-
-    try {
-
-        const response = await fetch(
-            "/api/state",
-            {cache: "no-store"}
-        );
-
-        const s = await response.json();
-
-
-        put(
-            "feed",
-            s.feed || "DISCONNECTED"
-        );
-
-        document.getElementById("feed").className =
-            s.feed === "LIVE" ? "live" : "dead";
-
-
-        put(
-            "assetTop",
-            s.asset || "UNKNOWN"
-        );
-
-
-        if (s.asset) {
-            document.getElementById("assetSel").value =
-                s.asset;
-        }
-
-
-        put(
-            "last",
-            s.feed === "LIVE"
-                ? "LIVE — last frame: " +
-                  (s.last_frame || "now")
-                : (
-                    s.analysis ||
-                    "Waiting for Pocket Option screen feed..."
-                  )
-        );
-
-
-        put(
-            "signal",
-            s.signal || "WAIT"
-        );
-
-        put(
-            "price",
-            Number(s.price || 0).toFixed(6)
-        );
-
-        put(
-            "confidence",
-            (s.confidence || 0) + "%"
-        );
-
-        put(
-            "entry",
-            Number(s.entry || 0).toFixed(6)
-        );
-
-        put(
-            "window",
-            (s.entry_window || 12) + "s"
-        );
-
-        put(
-            "candles",
-            s.candles || 0
-        );
-
-
-        ["ema9", "ema20", "ema50", "atr"]
-            .forEach(function(key) {
-
-                put(
-                    key,
-                    Number(s[key] || 0).toFixed(6)
-                );
-
-            });
-
-
-        ["rsi", "cci"]
-            .forEach(function(key) {
-
-                put(
-                    key,
-                    Number(s[key] || 0).toFixed(2)
-                );
-
-            });
-
-
-        put(
-            "analysis",
-            s.analysis ||
-            "Waiting for Pocket Option screen feed..."
-        );
-
-
-        put(
-            "tradeStats",
-
-            "Trades: " + (s.trades || 0) +
-            " | Wins: " + (s.wins || 0) +
-            " | Losses: " + (s.losses || 0)
-        );
-
-
-        const total =
-            (s.wins || 0) +
-            (s.losses || 0);
-
-
-        put(
-            "perf",
-
-            total
-                ? "Completed: " +
-                  total +
-                  " | Win rate: " +
-                  ((s.wins / total) * 100).toFixed(1) +
-                  "%"
-                : "No completed trades."
-        );
-
-    } catch (error) {
-
-        // Keep the dashboard alive if a poll fails.
-
-    }
-}
-
-
-setInterval(refresh, 1000);
-
-refresh();
-
-</script>
-
-</body>
-</html>
-"""
-
-HTML = HTML.replace(
-    "__ASSETS__",
-    repr(ASSETS)
-)
-
-
-@app.get("/")
-def home():
-    return Response(
-        HTML,
-        mimetype="text/html"
-    )
-
-
-@app.get("/api/state")
-def api_state():
-    return jsonify(get_state())
-
-
-@app.get("/api/health")
-def health():
-    return jsonify(
-        ok=True,
-        service="alucard-v2.1",
-        frame_endpoint="/api/frame"
-    )
-
-
-@app.post("/api/frame")
-def api_frame():
-
-    data = None
-    source = "none"
-
-    # EXACTLY matches the existing bridge:
-    #
-    # files={
-    #     "image": (
-    #         "alucard_live.jpg",
-    #         image_file,
-    #         "image/jpeg"
-    #     )
-    # }
-
-    if "image" in request.files:
-
-        data = request.files["image"].read()
-        source = "multipart:image"
-
-    elif "frame" in request.files:
-
-        data = request.files["frame"].read()
-        source = "multipart:frame"
-
-    elif request.data:
-
-        data = request.data
-        source = "raw"
-
-
-    if not data:
-
-        return jsonify(
-            ok=False,
-            error="No image received",
-            detail="POST a JPEG as multipart field 'image'"
-        ), 400
-
-
-    try:
-
-        image_format, width, height = \
-            validate_image(data)
-
-    except ValueError as exc:
-
-        with lock:
-            state["last_error"] = str(exc)
-
-        return jsonify(
-            ok=False,
-            error="Invalid image",
-            detail=str(exc)
-        ), 400
-
-
-    mark_frame_live()
-
-
-    return jsonify(
-        ok=True,
-        message="Image frame accepted",
-        feed="LIVE",
-        source=source,
-        format=image_format,
-        width=width,
-        height=height,
-        frames=state["frames"]
-    )
-
-
-@app.post("/api/feed")
-def api_feed():
-
-    payload = request.get_json(silent=True)
-
-
-    if not isinstance(payload, dict):
-
-        return jsonify(
-            ok=False,
-            error="No JSON data received"
-        ), 400
-
-
-    integer_fields = {
-        "candles",
-        "entry_window",
-        "fractal"
-    }
-
-    number_fields = {
-        "price",
-        "confidence",
-        "entry",
-        "ema9",
-        "ema20",
-        "ema50",
-        "rsi",
-        "atr",
-        "cci",
-        "macd",
-        "macd_signal",
-        "payout"
-    }
-
-
-    with lock:
-
-        for key in (
-            "asset",
-            "signal",
-            "analysis"
-        ):
-
-            if key in payload:
-                state[key] = str(payload[key])
-
-
-        for key in integer_fields:
-
-            if key in payload:
-
-                try:
-                    state[key] = int(
-                        float(payload[key])
-                    )
-
-                except (TypeError, ValueError):
-                    pass
-
-
-        for key in number_fields:
-
-            if key in payload:
-
-                try:
-                    state[key] = float(
-                        payload[key]
-                    )
-
-                except (TypeError, ValueError):
-                    pass
-
-
-        state["feed"] = "LIVE"
-        state["last_frame"] = timestamp()
-        state["frames"] += 1
-        state["last_error"] = ""
-
-
-    return jsonify(
-        ok=True,
-        message="JSON feed accepted",
-        state=get_state()
-    )
-
-
-@app.post("/api/reset")
-def reset():
-
-    with lock:
-
-        state.update({
-
-            "asset": "UNKNOWN",
-            "price": 0.0,
-            "signal": "WAIT",
-            "confidence": 0,
-            "entry": 0.0,
-            "entry_window": 12,
-            "candles": 0,
-
-            "feed": "DISCONNECTED",
-            "image_received": False,
-
-            "analysis":
-                "Waiting for Pocket Option screen feed...",
-
-            "ema9": 0.0,
-            "ema20": 0.0,
-            "ema50": 0.0,
-            "rsi": 0.0,
-            "atr": 0.0,
-            "cci": 0.0,
-            "macd": 0.0,
-            "macd_signal": 0.0,
-            "fractal": 2,
-
-            "payout": 0,
-
-            "last_frame": None,
-            "frames": 0,
-
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-
-            "last_error": ""
-        })
-
-
-    return jsonify(ok=True)
-
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=5000
-    )
+<div class="label
