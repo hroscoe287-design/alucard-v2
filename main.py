@@ -1,107 +1,142 @@
-import os
-import io
-import time
 import base64
+import io
+import math
+import threading
+import time
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
-from PIL import Image, ImageStat, ImageFilter
+from PIL import Image
+
+
+# ============================================================
+# ALUCARD V2
+# GOTHIC MARKET INTELLIGENCE
+# Render / Flask / Gunicorn
+#
+# Dependencies:
+#   Flask
+#   gunicorn
+#   Pillow
+#   requests
+#
+# NO OPENCV / cv2 REQUIRED
+# ============================================================
 
 app = Flask(__name__)
 
-VERSION = "ALUCARD-V2-CURRENCIES-FEED-4.0"
+VERSION = "ALUCARD-V2.5"
 
-FEED_TOKEN = os.environ.get("RYU_FEED_TOKEN", "").strip()
+FEED_TIMEOUT = 20
+ENTRY_WINDOW_SECONDS = 12
+FRACTAL_PERIOD = 2
+
 
 # ============================================================
-# CURRENCY MENU
+# CURRENCY / ASSET DATABASE
 # ============================================================
 
 CURRENCIES = [
-    # MAJORS
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD",
+    # Major Forex
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "AUDUSD",
+    "USDCAD",
+    "NZDUSD",
 
-    # EUR CROSSES
-    "EUR/GBP",
-    "EUR/JPY",
-    "EUR/CHF",
-    "EUR/AUD",
-    "EUR/CAD",
-    "EUR/NZD",
+    # Forex Crosses
+    "EURGBP",
+    "EURJPY",
+    "EURCHF",
+    "EURAUD",
+    "EURCAD",
+    "EURNZD",
+    "GBPJPY",
+    "GBPCHF",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPNZD",
+    "AUDJPY",
+    "AUDCAD",
+    "AUDCHF",
+    "AUDNZD",
+    "CADJPY",
+    "CADCHF",
+    "CHFJPY",
+    "NZDJPY",
+    "NZDCAD",
 
-    # GBP CROSSES
-    "GBP/JPY",
-    "GBP/CHF",
-    "GBP/AUD",
-    "GBP/CAD",
-    "GBP/NZD",
+    # OTC
+    "EURUSD_otc",
+    "GBPUSD_otc",
+    "USDJPY_otc",
+    "USDCHF_otc",
+    "AUDUSD_otc",
+    "USDCAD_otc",
+    "NZDUSD_otc",
+    "EURGBP_otc",
+    "EURJPY_otc",
+    "GBPJPY_otc",
+    "AUDJPY_otc",
+    "CADJPY_otc",
 
-    # AUD CROSSES
-    "AUD/JPY",
-    "AUD/CHF",
-    "AUD/CAD",
-    "AUD/NZD",
+    # Crypto
+    "BTCUSD",
+    "BTCUSD_otc",
+    "ETHUSD",
+    "ETHUSD_otc",
+    "LTCUSD",
+    "LTCUSD_otc",
+    "XRPUSD",
+    "XRPUSD_otc",
+    "DOGEUSD",
+    "DOGEUSD_otc",
 
-    # CAD CROSSES
-    "CAD/JPY",
-    "CAD/CHF",
+    # Commodities
+    "XAUUSD",
+    "XAUUSD_otc",
+    "XAGUSD",
+    "XAGUSD_otc",
+    "USOIL",
+    "USOIL_otc",
+    "UKOIL",
+    "UKOIL_otc",
+    "NATURALGAS",
+    "NATURALGAS_otc",
 
-    # NZD CROSSES
-    "NZD/JPY",
-    "NZD/CHF",
+    # Stocks
+    "AAPL",
+    "AAPL_otc",
+    "TSLA",
+    "TSLA_otc",
+    "AMZN",
+    "AMZN_otc",
+    "MSFT",
+    "MSFT_otc",
+    "GOOGL",
+    "GOOGL_otc",
+    "META",
+    "META_otc",
+    "NVDA",
+    "NVDA_otc",
 
-    # CHF / JPY
-    "CHF/JPY",
-
-    # USD CROSSES
-    "USD/SGD",
-    "USD/HKD",
-    "USD/SEK",
-    "USD/NOK",
-    "USD/DKK",
-    "USD/PLN",
-    "USD/TRY",
-    "USD/MXN",
-    "USD/ZAR",
-
-    # EUR ADDITIONAL
-    "EUR/SEK",
-    "EUR/NOK",
-    "EUR/PLN",
-    "EUR/TRY",
-    "EUR/ZAR",
-
-    # GBP ADDITIONAL
-    "GBP/SGD",
-    "GBP/ZAR",
-
-    # ASIAN
-    "SGD/JPY",
-    "HKD/JPY",
-
-    # OTC COMMON NAMES
-    "EUR/USD OTC",
-    "GBP/USD OTC",
-    "USD/JPY OTC",
-    "USD/CHF OTC",
-    "AUD/USD OTC",
-    "USD/CAD OTC",
-    "NZD/USD OTC",
-    "EUR/GBP OTC",
-    "EUR/JPY OTC",
-    "GBP/JPY OTC",
-    "AUD/JPY OTC",
-    "EUR/AUD OTC",
-    "GBP/AUD OTC",
-    "USD/SGD OTC",
-    "USD/HKD OTC",
-    "USD/MXN OTC",
+    # Indices
+    "SP500",
+    "SP500_otc",
+    "NASDAQ",
+    "NASDAQ_otc",
+    "DOW",
+    "DOW_otc",
+    "DAX",
+    "DAX_otc",
+    "FTSE",
+    "FTSE_otc",
+    "CAC40",
+    "CAC40_otc",
+    "NIKKEI",
+    "NIKKEI_otc",
 ]
 
 
@@ -109,9 +144,15 @@ CURRENCIES = [
 # GLOBAL STATE
 # ============================================================
 
+STATE_LOCK = threading.Lock()
+
 STATE = {
-    "connected": False,
+    "version": VERSION,
+
     "feed": "DISCONNECTED",
+    "feed_health": "OFFLINE",
+    "last_feed": 0.0,
+    "last_feed_time": None,
 
     "asset": "UNKNOWN",
     "price": 0.0,
@@ -120,39 +161,52 @@ STATE = {
     "confidence": 0,
 
     "entry": 0.0,
-    "entry_window": 12,
+    "entry_window": ENTRY_WINDOW_SECONDS,
 
     "candles": 0,
-    "fractal": 2,
+
+    "fractal": FRACTAL_PERIOD,
 
     "ema9": 0.0,
     "ema20": 0.0,
     "ema50": 0.0,
 
     "rsi": 0.0,
-    "macd": 0.0,
+    "atr": 0.0,
     "cci": 0.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
 
     "analysis": "Waiting for screen feed...",
 
-    "last_frame": 0.0,
-    "last_update": "",
-
     "image_received": False,
-    "frame_bytes": 0,
-    "frame_width": 0,
-    "frame_height": 0,
+    "image_size": 0,
 
-    "selected_currency": "EUR/USD",
+    "selected_currency": "EURUSD_otc",
+
+    "payout": 0,
+
+    "scan_count": 0,
+    "signal_count": 0,
+
+    "wins": 0,
+    "losses": 0,
+
+    "updated": None,
 }
 
 
 # ============================================================
-# HELPERS
+# CANDLE / PRICE STORAGE
 # ============================================================
 
-def now_string():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+PRICE_HISTORY = []
+
+MAX_PRICES = 250
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def safe_float(value, default=0.0):
@@ -164,937 +218,309 @@ def safe_float(value, default=0.0):
         return default
 
 
-def safe_int(value, default=0):
-    try:
-        if value is None:
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
 def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def token_ok(req):
-    if not FEED_TOKEN:
-        return True
-
-    supplied = (
-        req.headers.get("X-RYU-TOKEN")
-        or req.headers.get("X-ALUCARD-TOKEN")
-        or req.args.get("token")
-        or ""
-    )
-
-    return supplied == FEED_TOKEN
-
-
 # ============================================================
-# IMAGE EXTRACTION
+# INDICATORS
 # ============================================================
 
-def image_from_request(req):
+def ema(values, period):
+    if not values:
+        return 0.0
 
-    # Multipart uploads
-    for name in ("image", "file", "frame", "screenshot"):
+    if len(values) < period:
+        return sum(values) / len(values)
 
-        uploaded = req.files.get(name)
+    multiplier = 2.0 / (period + 1.0)
 
-        if uploaded:
-            data = uploaded.read()
+    result = sum(values[:period]) / period
 
-            if data:
-                return data
+    for value in values[period:]:
+        result = (value - result) * multiplier + result
 
-    # Raw image POST
-    raw = req.get_data(cache=True)
-
-    if raw:
-
-        content_type = (req.content_type or "").lower()
-
-        if (
-            content_type.startswith("image/")
-            or raw.startswith(b"\xff\xd8")
-            or raw.startswith(b"\x89PNG")
-            or raw.startswith(b"RIFF")
-            or raw.startswith(b"GIF8")
-        ):
-            return raw
-
-    # JSON/base64 image
-    try:
-
-        data = req.get_json(silent=True)
-
-        if isinstance(data, dict):
-
-            for key in (
-                "image",
-                "frame",
-                "screenshot",
-                "data",
-                "image_base64",
-            ):
-
-                value = data.get(key)
-
-                if not value:
-                    continue
-
-                if isinstance(value, str):
-
-                    if value.startswith("data:") and "," in value:
-                        value = value.split(",", 1)[1]
-
-                    try:
-                        decoded = base64.b64decode(value)
-
-                        if decoded:
-                            return decoded
-
-                    except Exception:
-                        pass
-
-    except Exception:
-        pass
-
-    return None
+    return result
 
 
-# ============================================================
-# SCREEN ANALYSIS
-# ============================================================
+def calculate_rsi(values, period=14):
+    if len(values) < 2:
+        return 0.0
 
-def analyze_screen(image_bytes):
+    data = values[-(period + 1):]
 
-    try:
+    gains = []
+    losses = []
 
-        image = Image.open(io.BytesIO(image_bytes))
-        image.load()
+    for i in range(1, len(data)):
+        change = data[i] - data[i - 1]
 
-        width, height = image.size
-
-        preview = image.convert("RGB")
-
-        if width > 800:
-
-            new_width = 800
-            new_height = max(
-                1,
-                int(height * new_width / width)
-            )
-
-            preview = preview.resize(
-                (new_width, new_height)
-            )
-
-        preview = preview.filter(
-            ImageFilter.MedianFilter(size=3)
-        )
-
-        stat = ImageStat.Stat(preview)
-
-        mean_r, mean_g, mean_b = stat.mean[:3]
-
-        brightness = (
-            mean_r +
-            mean_g +
-            mean_b
-        ) / 3.0
-
-        green_bias = (
-            mean_g -
-            ((mean_r + mean_b) / 2.0)
-        )
-
-        if green_bias > 2:
-
-            description = (
-                "Live screen feed received. "
-                "Chart detected."
-            )
-
-        elif brightness < 25:
-
-            description = (
-                "Live screen feed received. "
-                "Screen appears dark."
-            )
-
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
         else:
+            gains.append(0.0)
+            losses.append(abs(change))
 
-            description = (
-                "Live screen feed received. "
-                "Analyzing chart."
-            )
+    if not gains:
+        return 50.0
 
+    avg_gain = sum(gains) / len(gains)
+    avg_loss = sum(losses) / len(losses)
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def calculate_atr(values, period=14):
+    if len(values) < 2:
+        return 0.0
+
+    changes = []
+
+    for i in range(1, len(values)):
+        changes.append(abs(values[i] - values[i - 1]))
+
+    recent = changes[-period:]
+
+    if not recent:
+        return 0.0
+
+    return sum(recent) / len(recent)
+
+
+def calculate_cci(values, period=20):
+    if len(values) < 2:
+        return 0.0
+
+    recent = values[-period:]
+
+    if not recent:
+        return 0.0
+
+    mean = sum(recent) / len(recent)
+
+    deviation = sum(abs(x - mean) for x in recent) / len(recent)
+
+    if deviation == 0:
+        return 0.0
+
+    current = recent[-1]
+
+    return (current - mean) / (0.015 * deviation)
+
+
+def calculate_macd(values):
+    if len(values) < 5:
+        return 0.0, 0.0
+
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    macd_value = fast - slow
+
+    # Small-history approximation for signal line.
+    macd_values = []
+
+    start = max(0, len(values) - 35)
+
+    for i in range(start, len(values)):
+        subset = values[:i + 1]
+
+        if len(subset) < 3:
+            continue
+
+        macd_values.append(
+            ema(subset, 12) - ema(subset, 26)
+        )
+
+    if not macd_values:
+        signal = macd_value
+    else:
+        signal = ema(macd_values, 9)
+
+    return macd_value, signal
+
+
+def fractal_direction(values, period=2):
+    """
+    Simple fractal-style price structure.
+
+    Positive = bullish structure
+    Negative = bearish structure
+    Zero = neutral
+    """
+
+    needed = period * 2 + 1
+
+    if len(values) < needed:
+        return 0
+
+    center = len(values) - period - 1
+
+    if center < period:
+        return 0
+
+    current = values[center]
+
+    left = values[center - period:center]
+    right = values[center + 1:center + period + 1]
+
+    if current > max(left) and current > max(right):
+        return 1
+
+    if current < min(left) and current < min(right):
+        return -1
+
+    return 0
+
+
+# ============================================================
+# ANALYSIS ENGINE
+# ============================================================
+
+def analyze_prices(values):
+    if len(values) < 5:
         return {
-            "width": width,
-            "height": height,
-            "brightness": round(brightness, 2),
-            "green_bias": round(green_bias, 2),
-            "analysis": description,
+            "signal": "WAIT",
+            "confidence": 0,
+            "analysis": "Collecting market data...",
+            "ema9": ema(values, 9),
+            "ema20": ema(values, 20),
+            "ema50": ema(values, 50),
+            "rsi": calculate_rsi(values),
+            "atr": calculate_atr(values),
+            "cci": calculate_cci(values),
+            "macd": 0.0,
+            "macd_signal": 0.0,
+            "fractal": 0,
         }
 
-    except Exception as exc:
+    ema9_value = ema(values, 9)
+    ema20_value = ema(values, 20)
+    ema50_value = ema(values, 50)
 
-        raise ValueError(
-            "Invalid image: " + str(exc)
-        )
+    rsi_value = calculate_rsi(values)
+    atr_value = calculate_atr(values)
+    cci_value = calculate_cci(values)
 
+    macd_value, macd_signal_value = calculate_macd(values)
 
-# ============================================================
-# UPDATE STATE
-# ============================================================
+    fractal = fractal_direction(
+        values,
+        FRACTAL_PERIOD
+    )
 
-def update_live_state(extra=None, image_info=None):
+    score = 0
+    reasons = []
 
-    with STATE_LOCK:
+    # EMA trend
+    if ema9_value > ema20_value:
+        score += 2
+        reasons.append("EMA9 above EMA20")
+    elif ema9_value < ema20_value:
+        score -= 2
+        reasons.append("EMA9 below EMA20")
 
-        STATE["connected"] = True
-        STATE["feed"] = "LIVE"
+    if ema20_value > ema50_value:
+        score += 2
+        reasons.append("EMA20 above EMA50")
+    elif ema20_value < ema50_value:
+        score -= 2
+        reasons.append("EMA20 below EMA50")
 
-        STATE["last_frame"] = time.time()
-        STATE["last_update"] = now_string()
+    # RSI
+    if rsi_value >= 55:
+        score += 1
+        reasons.append("RSI bullish")
+    elif rsi_value <= 45:
+        score -= 1
+        reasons.append("RSI bearish")
 
-        if image_info:
+    # CCI
+    if cci_value > 50:
+        score += 1
+        reasons.append("CCI bullish")
+    elif cci_value < -50:
+        score -= 1
+        reasons.append("CCI bearish")
 
-            STATE["image_received"] = True
+    # MACD
+    if macd_value > macd_signal_value:
+        score += 1
+        reasons.append("MACD bullish")
+    elif macd_value < macd_signal_value:
+        score -= 1
+        reasons.append("MACD bearish")
 
-            STATE["frame_width"] = image_info["width"]
-            STATE["frame_height"] = image_info["height"]
+    # Fractal
+    if fractal > 0:
+        score += 1
+        reasons.append("Fractal bullish")
+    elif fractal < 0:
+        score -= 1
+        reasons.append("Fractal bearish")
 
-            STATE["analysis"] = image_info["analysis"]
+    # Confidence is based on indicator agreement.
+    strength = abs(score)
 
-        if extra:
-
-            for key in (
-                "asset",
-                "price",
-                "signal",
-                "confidence",
-                "entry",
-                "entry_window",
-                "candles",
-                "fractal",
-                "ema9",
-                "ema20",
-                "ema50",
-                "rsi",
-                "macd",
-                "cci",
-            ):
-
-                if key not in extra:
-                    continue
-
-                value = extra[key]
-
-                if key in (
-                    "price",
-                    "entry",
-                    "ema9",
-                    "ema20",
-                    "ema50",
-                    "rsi",
-                    "macd",
-                    "cci",
-                ):
-
-                    value = safe_float(value)
-
-                elif key in (
-                    "confidence",
-                    "entry_window",
-                    "candles",
-                    "fractal",
-                ):
-
-                    value = safe_int(value)
-
-                elif key == "signal":
-
-                    value = str(value).upper()
-
-                elif key == "asset":
-
-                    value = str(value)
-
-                STATE[key] = value
-
-        if STATE["signal"] not in (
-            "CALL",
-            "PUT",
-            "WAIT",
-        ):
-
-            STATE["signal"] = "WAIT"
-
-        STATE["confidence"] = clamp(
-            safe_int(STATE["confidence"]),
+    confidence = int(
+        clamp(
+            50 + (strength * 7),
             0,
-            100
+            96
         )
+    )
 
-        # User requested Fractal 2.
-        STATE["fractal"] = 2
+    # Require meaningful agreement.
+    if score >= 5:
+        signal = "CALL"
+    elif score <= -5:
+        signal = "PUT"
+    else:
+        signal = "WAIT"
 
+    if signal == "WAIT":
+        confidence = min(confidence, 69)
 
-STATE_LOCK = __import__("threading").Lock()
+    if signal == "CALL":
+        analysis = "BULLISH — " + ", ".join(reasons[-4:])
+
+    elif signal == "PUT":
+        analysis = "BEARISH — " + ", ".join(reasons[-4:])
+
+    else:
+        analysis = "WAIT — indicators are not sufficiently aligned."
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "analysis": analysis,
+
+        "ema9": ema9_value,
+        "ema20": ema20_value,
+        "ema50": ema50_value,
+
+        "rsi": rsi_value,
+        "atr": atr_value,
+        "cci": cci_value,
+
+        "macd": macd_value,
+        "macd_signal": macd_signal_value,
+
+        "fractal": fractal,
+    }
 
 
 # ============================================================
-# HEALTH
+# FEED MANAGEMENT
 # ============================================================
 
-@app.route("/health")
-def health():
-
-    return jsonify({
-        "ok": True,
-        "service": "ALUCARD V2",
-        "version": VERSION,
-        "feed_endpoint": "/api/feed",
-        "currencies": len(CURRENCIES),
-    })
-
-
-@app.route("/api/health")
-def api_health():
-
+def mark_feed_live():
     with STATE_LOCK:
-
-        return jsonify({
-            "ok": True,
-            "service": "ALUCARD V2",
-            "version": VERSION,
-            "connected": STATE["connected"],
-            "feed": STATE["feed"],
-            "image_received": STATE["image_received"],
-        })
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-@app.route("/api/state")
-def api_state():
-
-    with STATE_LOCK:
-
-        age = time.time() - STATE["last_frame"]
-
-        if (
-            STATE["last_frame"] > 0
-            and age > 15
-        ):
-
-            STATE["connected"] = False
-            STATE["feed"] = "DISCONNECTED"
-
-            if STATE["image_received"]:
-
-                STATE["analysis"] = (
-                    "Screen feed stopped. "
-                    "Waiting for next frame..."
-                )
-
-        return jsonify(dict(STATE))
-
-
-# ============================================================
-# CURRENCY API
-# ============================================================
-
-@app.route("/api/currencies")
-def api_currencies():
-
-    return jsonify({
-        "ok": True,
-        "count": len(CURRENCIES),
-        "currencies": CURRENCIES,
-    })
-
-
-@app.route("/api/currency", methods=["POST"])
-def api_currency():
-
-    data = request.get_json(silent=True) or {}
-
-    currency = str(
-        data.get("currency", "")
-    ).strip()
-
-    if currency not in CURRENCIES:
-
-        return jsonify({
-            "ok": False,
-            "error": "Currency not found",
-        }), 400
-
-    with STATE_LOCK:
-
-        STATE["selected_currency"] = currency
-
-        # Only change asset if the live feed has not supplied one.
-        if (
-            not STATE["asset"]
-            or STATE["asset"] == "UNKNOWN"
-        ):
-
-            STATE["asset"] = currency
-
-    return jsonify({
-        "ok": True,
-        "selected_currency": currency,
-    })
-
-
-# ============================================================
-# FEED
-# ============================================================
-
-@app.route("/api/feed", methods=["POST"])
-def api_feed():
-
-    if not token_ok(request):
-
-        return jsonify({
-            "ok": False,
-            "error": "Invalid feed token",
-        }), 401
-
-    image_bytes = image_from_request(request)
-
-    # --------------------------------------------------------
-    # SCREEN IMAGE
-    # --------------------------------------------------------
-
-    if image_bytes:
-
-        try:
-
-            image_info = analyze_screen(
-                image_bytes
-            )
-
-            update_live_state(
-                image_info=image_info
-            )
-
-            with STATE_LOCK:
-
-                STATE["frame_bytes"] = len(
-                    image_bytes
-                )
-
-                state_copy = dict(STATE)
-
-            return jsonify({
-                "ok": True,
-                "message": "Screen frame accepted",
-                "state": state_copy,
-            }), 200
-
-        except Exception as exc:
-
-            return jsonify({
-                "ok": False,
-                "error": str(exc),
-            }), 400
-
-    # --------------------------------------------------------
-    # JSON MARKET DATA
-    # --------------------------------------------------------
-
-    data = request.get_json(silent=True)
-
-    if isinstance(data, dict):
-
-        update_live_state(
-            extra=data
-        )
-
-        with STATE_LOCK:
-
-            state_copy = dict(STATE)
-
-        return jsonify({
-            "ok": True,
-            "message": "JSON feed accepted",
-            "state": state_copy,
-        }), 200
-
-    return jsonify({
-        "ok": False,
-        "error": "No image or JSON feed data received",
-    }), 400
-
-
-# ============================================================
-# ALIASES
-# ============================================================
-
-@app.route("/api/screenshot", methods=["POST"])
-def screenshot():
-
-    return api_feed()
-
-
-@app.route("/feed", methods=["POST"])
-def feed():
-
-    return api_feed()
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-HTML = r"""
-<!DOCTYPE html>
-<html>
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>ALUCARD V2</title>
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-
-    margin: 0;
-
-    background:
-        radial-gradient(
-            circle at top,
-            #242424 0%,
-            #080808 55%,
-            #000000 100%
-        );
-
-    color: #eeeeee;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-}
-
-.header {
-
-    padding: 18px;
-
-    text-align: center;
-
-    background: #090909;
-
-    border-bottom: 1px solid #333;
-}
-
-.title {
-
-    font-size: 30px;
-
-    font-weight: 900;
-
-    letter-spacing: 5px;
-}
-
-.subtitle {
-
-    margin-top: 5px;
-
-    color: #888;
-
-    font-size: 12px;
-
-    letter-spacing: 3px;
-}
-
-.status {
-
-    margin-top: 12px;
-
-    font-weight: bold;
-}
-
-.live {
-    color: #55ff88;
-}
-
-.dead {
-    color: #ff5555;
-}
-
-.tabs {
-
-    display: flex;
-
-    justify-content: center;
-
-    gap: 4px;
-
-    padding: 10px;
-
-    background: #101010;
-
-    border-bottom: 1px solid #292929;
-
-    overflow-x: auto;
-}
-
-.tab {
-
-    padding: 10px 18px;
-
-    border: 1px solid #292929;
-
-    color: #888;
-
-    white-space: nowrap;
-}
-
-.tab.active {
-
-    background: #1d1d1d;
-
-    color: white;
-}
-
-.container {
-
-    max-width: 1150px;
-
-    margin: auto;
-
-    padding: 15px;
-}
-
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 10px;
-}
-
-.card {
-
-    padding: 15px;
-
-    min-height: 105px;
-
-    background: rgba(15,15,15,.96);
-
-    border: 1px solid #303030;
-}
-
-.label {
-
-    color: #777;
-
-    font-size: 11px;
-
-    letter-spacing: 2px;
-
-    text-transform: uppercase;
-}
-
-.value {
-
-    margin-top: 9px;
-
-    font-size: 25px;
-
-    font-weight: bold;
-
-    overflow-wrap: anywhere;
-}
-
-.signal {
-
-    font-size: 34px;
-
-    letter-spacing: 3px;
-}
-
-.analysis {
-
-    grid-column: 1 / -1;
-
-    min-height: 125px;
-}
-
-.analysisText {
-
-    margin-top: 12px;
-
-    font-size: 18px;
-}
-
-.small {
-
-    color: #777;
-
-    font-size: 12px;
-
-    margin-top: 7px;
-}
-
-.metrics {
-
-    grid-column: 1 / -1;
-}
-
-.metric-grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(6, 1fr);
-
-    gap: 8px;
-
-    margin-top: 12px;
-}
-
-.metric {
-
-    padding: 10px;
-
-    background: #111;
-
-    border: 1px solid #292929;
-}
-
-.metric .name {
-
-    color: #777;
-
-    font-size: 10px;
-}
-
-.metric .number {
-
-    margin-top: 6px;
-
-    font-weight: bold;
-}
-
-
-/* ========================================================
-   CURRENCY MENU
-   ======================================================== */
-
-.currency-card {
-
-    grid-column: 1 / -1;
-
-    padding: 15px;
-
-    background: #0c0c0c;
-
-    border: 1px solid #343434;
-}
-
-.currency-header {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    align-items: center;
-
-    gap: 10px;
-
-    flex-wrap: wrap;
-}
-
-.currency-title {
-
-    font-size: 16px;
-
-    font-weight: bold;
-
-    letter-spacing: 2px;
-}
-
-.currency-search {
-
-    width: 100%;
-
-    max-width: 300px;
-
-    padding: 11px;
-
-    border: 1px solid #444;
-
-    background: #050505;
-
-    color: white;
-
-    outline: none;
-}
-
-.currency-list {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(4, 1fr);
-
-    gap: 6px;
-
-    margin-top: 12px;
-
-    max-height: 310px;
-
-    overflow-y: auto;
-
-    padding-right: 3px;
-}
-
-.currency-button {
-
-    padding: 10px 6px;
-
-    border: 1px solid #292929;
-
-    background: #111;
-
-    color: #aaa;
-
-    cursor: pointer;
-
-    text-align: center;
-
-    font-size: 12px;
-}
-
-.currency-button:hover {
-
-    background: #222;
-
-    color: white;
-}
-
-.currency-button.selected {
-
-    background: #292929;
-
-    color: white;
-
-    border-color: #777;
-}
-
-.selected-currency {
-
-    margin-top: 12px;
-
-    font-size: 13px;
-
-    color: #888;
-}
-
-.selected-currency strong {
-
-    color: white;
-}
-
-
-/* ========================================================
-   FEED
-   ======================================================== */
-
-.feedbox {
-
-    grid-column: 1 / -1;
-
-    padding: 14px;
-
-    background: #0c0c0c;
-
-    border: 1px solid #303030;
-}
-
-
-/* ========================================================
-   MOBILE
-   ======================================================== */
-
-@media(max-width:850px) {
-
-    .grid {
-
-        grid-template-columns:
-            repeat(2, 1fr);
-    }
-
-    .metric-grid {
-
-        grid-template-columns:
-            repeat(3, 1fr);
-    }
-
-    .currency-list {
-
-        grid-template-columns:
-            repeat(2, 1fr);
-    }
-}
-
-@media(max-width:500px) {
-
-    .grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
-    .metric-grid {
-
-        grid-template-columns:
-            repeat(2, 1fr);
-    }
-
-    .currency-list {
-
-        grid-template-columns:
-            repeat(2, 1fr);
-    }
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-
-<!-- ======================================================
-     HEADER
-     ====================================================== -->
-
-<div class="header">
-
-    <div class="title">
-       
+        STATE["feed"] = "LIVE"
+        STATE["feed
