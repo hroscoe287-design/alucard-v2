@@ -1,39 +1,31 @@
-from flask import Flask, request, jsonify, Response
-import time
+import os
 import io
-import threading
+import time
 import math
+import threading
+from datetime import datetime, timezone
 
-from PIL import Image, ImageFilter
+from flask import Flask, request, jsonify, render_template_string
+from PIL import Image
 
 app = Flask(__name__)
 
 # ============================================================
 # ALUCARD V2.1
-# LIVE SCREEN FEED + IMAGE CANDLE ANALYSIS
+# Screen-feed compatible
 # No OpenCV required
 # ============================================================
 
-FRAME_TIMEOUT = 25
-MAX_FRAMES = 60
+RYU_FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "").strip()
 
-latest_frame = None
-lock = threading.Lock()
+STATE_LOCK = threading.Lock()
 
-state = {
+STATE = {
     "feed": "DISCONNECTED",
-    "connected": False,
-    "image_received": False,
-    "last_update": 0,
-    "last_frame": "none",
-    "frame_count": 0,
-
-    "asset": "EURUSD",
-    "price": 0.0,
-
+    "asset": "UNKNOWN",
     "signal": "WAIT",
+    "price": 0.0,
     "confidence": 0,
-
     "entry": 0.0,
     "entry_window": 12,
     "candles": 0,
@@ -46,61 +38,92 @@ state = {
     "rsi": 0.0,
     "cci": 0.0,
     "atr": 0.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
+    "sar": 0.0,
 
-    "analysis": "Waiting for enough chart data..."
+    "analysis": "Waiting for screen feed...",
+    "last_frame": None,
+    "image_received": False,
+    "frame_bytes": 0,
+    "updated": 0.0
 }
 
-# Screen-derived candle measurements.
-# These are normalized chart measurements, not fabricated market prices.
-candle_history = []
+LAST_IMAGE = None
 
 
 # ============================================================
-# TIME
+# HELPERS
 # ============================================================
 
-def utc_text():
-    return time.strftime(
-        "%Y-%m-%d %H:%M:%S UTC",
-        time.gmtime()
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def valid_token(req):
+    if not RYU_FEED_TOKEN:
+        return True
+
+    supplied = (
+        req.headers.get("X-RYU-TOKEN")
+        or req.headers.get("X-ALUCARD-TOKEN")
+        or request.args.get("token")
+        or ""
     )
 
-
-# ============================================================
-# FEED STATUS
-# ============================================================
-
-def update_status():
-    with lock:
-        last = state["last_update"]
-
-        if last and (time.time() - last) <= FRAME_TIMEOUT:
-            state["feed"] = "LIVE"
-            state["connected"] = True
-        else:
-            state["feed"] = "DISCONNECTED"
-            state["connected"] = False
+    return supplied == RYU_FEED_TOKEN
 
 
-# ============================================================
-# BASIC MATH
-# ============================================================
+def clean_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
 
-def ema(values, period):
-    if len(values) < period:
+        x = float(value)
+
+        if not math.isfinite(x):
+            return default
+
+        return x
+    except Exception:
+        return default
+
+
+def clean_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def calculate_ema(values, period):
+    if not values:
         return 0.0
 
-    k = 2.0 / (period + 1.0)
-    value = sum(values[:period]) / period
+    if len(values) < period:
+        period = len(values)
 
-    for x in values[period:]:
-        value = (x * k) + (value * (1.0 - k))
+    if period <= 0:
+        return 0.0
 
-    return value
+    multiplier = 2.0 / (period + 1.0)
+
+    ema = sum(values[:period]) / period
+
+    for price in values[period:]:
+        ema = (price - ema) * multiplier + ema
+
+    return ema
 
 
-def rsi(values, period=14):
-    if len(values) <= period:
+def calculate_rsi(values, period=14):
+    if len(values) < 2:
+        return 0.0
+
+    if len(values) < period + 1:
+        period = len(values) - 1
+
+    if period <= 0:
         return 0.0
 
     gains = []
@@ -116,1149 +139,1139 @@ def rsi(values, period=14):
             gains.append(0.0)
             losses.append(abs(change))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    gains = gains[-period:]
+    losses = losses[-period:]
 
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
+
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def cci(values, period=20):
-    if len(values) < period:
+def calculate_cci(candles, period=20):
+    if len(candles) < 3:
         return 0.0
 
-    window = values[-period:]
-    mean = sum(window) / period
+    period = min(period, len(candles))
 
-    deviations = [
-        abs(x - mean)
-        for x in window
-    ]
+    typical = []
 
-    mean_deviation = sum(deviations) / period
+    for c in candles[-period:]:
+        h = clean_float(c.get("high"))
+        l = clean_float(c.get("low"))
+        close = clean_float(c.get("close"))
 
-    if mean_deviation == 0:
+        typical.append((h + l + close) / 3.0)
+
+    if not typical:
         return 0.0
 
-    return (values[-1] - mean) / (0.015 * mean_deviation)
+    mean = sum(typical) / len(typical)
 
+    deviation = sum(abs(x - mean) for x in typical) / len(typical)
 
-def atr(values, period=14):
-    if len(values) <= period:
+    if deviation == 0:
         return 0.0
 
-    ranges = []
-
-    for i in range(1, len(values)):
-        ranges.append(abs(values[i] - values[i - 1]))
-
-    return sum(ranges[-period:]) / period
+    return (typical[-1] - mean) / (0.015 * deviation)
 
 
-# ============================================================
-# IMAGE ANALYSIS
-# ============================================================
+def calculate_atr(candles, period=14):
+    if len(candles) < 2:
+        return 0.0
 
-def image_to_candle_series(image):
-    """
-    Attempts to detect vertical candle-like structures from
-    the incoming screenshot.
+    trs = []
 
-    This does NOT claim to know the broker's actual price scale.
-    It extracts relative candle movement from the chart image.
-    """
+    previous_close = clean_float(candles[0].get("close"))
 
-    try:
-        img = image.convert("RGB")
+    for c in candles[1:]:
+        high = clean_float(c.get("high"))
+        low = clean_float(c.get("low"))
+        close = clean_float(c.get("close"))
 
-        width, height = img.size
-
-        if width < 100 or height < 100:
-            return []
-
-        # Work on a smaller copy for speed.
-        target_width = 500
-
-        ratio = target_width / float(width)
-        target_height = max(100, int(height * ratio))
-
-        img = img.resize(
-            (target_width, target_height)
+        tr = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close)
         )
 
-        img = img.filter(
-            ImageFilter.SHARPEN
-        )
+        trs.append(tr)
+        previous_close = close
 
-        w, h = img.size
+    if not trs:
+        return 0.0
 
-        # Ignore top/bottom UI regions.
-        top = int(h * 0.18)
-        bottom = int(h * 0.82)
-
-        if bottom <= top:
-            return []
-
-        pixels = img.load()
-
-        # Calculate brightness/color contrast by x column.
-        column_activity = []
-
-        for x in range(w):
-            active = 0
-
-            for y in range(top, bottom, 3):
-                r, g, b = pixels[x, y]
-
-                brightness = (
-                    int(r) +
-                    int(g) +
-                    int(b)
-                ) / 3.0
-
-                # Bright chart marks against dark chart background.
-                if brightness > 125:
-                    active += 1
-
-            column_activity.append(active)
-
-        # Group active columns.
-        groups = []
-        start = None
-
-        for x, value in enumerate(column_activity):
-
-            if value >= 2:
-
-                if start is None:
-                    start = x
-
-            else:
-
-                if start is not None:
-                    if x - start >= 1:
-                        groups.append((start, x - 1))
-
-                    start = None
-
-        if start is not None:
-            groups.append((start, w - 1))
-
-        # Filter tiny UI/noise groups.
-        groups = [
-            g for g in groups
-            if 2 <= (g[1] - g[0] + 1) <= 20
-        ]
-
-        if len(groups) < 5:
-            return []
-
-        # Sample centers of groups.
-        centers = []
-
-        for left, right in groups:
-            center = (left + right) // 2
-
-            ys = []
-
-            for y in range(top, bottom, 2):
-
-                r, g, b = pixels[center, y]
-
-                brightness = (
-                    int(r) +
-                    int(g) +
-                    int(b)
-                ) / 3.0
-
-                if brightness > 125:
-                    ys.append(y)
-
-            if len(ys) >= 2:
-
-                high = min(ys)
-                low = max(ys)
-                middle = (high + low) / 2.0
-
-                centers.append(
-                    (middle, high, low)
-                )
-
-        if len(centers) < 5:
-            return []
-
-        # Convert screen Y position to normalized price movement.
-        # Lower Y = higher chart value.
-        values = []
-
-        for middle, high, low in centers:
-            normalized = (
-                (bottom - middle) /
-                max(1.0, float(bottom - top))
-            )
-
-            values.append(normalized)
-
-        # Remove obviously impossible values.
-        values = [
-            max(0.0, min(1.0, x))
-            for x in values
-        ]
-
-        return values[-MAX_FRAMES:]
-
-    except Exception:
-        return []
+    return sum(trs[-period:]) / min(period, len(trs))
 
 
-# ============================================================
-# ANALYSIS ENGINE
-# ============================================================
+def calculate_macd(values):
+    if len(values) < 5:
+        return 0.0, 0.0
 
-def analyze_series(values):
+    ema12 = calculate_ema(values, min(12, len(values)))
+    ema26 = calculate_ema(values, min(26, len(values)))
 
-    if len(values) < 20:
+    macd = ema12 - ema26
+
+    # A compact signal approximation.
+    signal = macd
+
+    return macd, signal
+
+
+def analyze_candles(candles):
+    if not candles:
         return {
             "signal": "WAIT",
             "confidence": 0,
-            "ema9": 0.0,
-            "ema20": 0.0,
-            "ema50": 0.0,
-            "rsi": 0.0,
-            "cci": 0.0,
-            "atr": 0.0,
-            "analysis": "Waiting for 20+ usable chart observations..."
+            "analysis": "Screen feed received, but no structured candle data is available."
         }
 
-    e9 = ema(values, 9)
-    e20 = ema(values, 20)
+    closes = [
+        clean_float(c.get("close"))
+        for c in candles
+        if clean_float(c.get("close")) > 0
+    ]
 
-    # EMA50 needs 50 observations.
-    e50 = ema(values, 50) if len(values) >= 50 else 0.0
+    if len(closes) < 3:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "analysis": "Not enough candle data for analysis."
+        }
 
-    r = rsi(values)
-    c = cci(values)
-    a = atr(values)
+    ema9 = calculate_ema(closes, min(9, len(closes)))
+    ema20 = calculate_ema(closes, min(20, len(closes)))
+    ema50 = calculate_ema(closes, min(50, len(closes)))
 
-    current = values[-1]
+    rsi = calculate_rsi(closes)
+    cci = calculate_cci(candles)
+    atr = calculate_atr(candles)
+    macd, macd_signal = calculate_macd(closes)
 
-    score_call = 0
-    score_put = 0
+    price = closes[-1]
 
-    # Trend
-    if e9 > e20:
-        score_call += 2
-    elif e9 < e20:
-        score_put += 2
+    bullish = 0
+    bearish = 0
 
-    # Momentum
-    if r >= 55:
-        score_call += 1
-    elif r <= 45:
-        score_put += 1
+    # EMA structure
+    if ema9 > ema20:
+        bullish += 1
+    elif ema9 < ema20:
+        bearish += 1
+
+    if ema20 > ema50:
+        bullish += 1
+    elif ema20 < ema50:
+        bearish += 1
+
+    # RSI
+    if 50 < rsi < 75:
+        bullish += 1
+    elif 25 < rsi < 50:
+        bearish += 1
 
     # CCI
-    if c > 50:
-        score_call += 1
-    elif c < -50:
-        score_put += 1
+    if cci > 0:
+        bullish += 1
+    elif cci < 0:
+        bearish += 1
 
-    # Recent movement
-    recent = values[-5:]
+    # MACD
+    if macd > macd_signal:
+        bullish += 1
+    elif macd < macd_signal:
+        bearish += 1
 
-    if recent[-1] > recent[0]:
-        score_call += 1
-    elif recent[-1] < recent[0]:
-        score_put += 1
+    total = bullish + bearish
 
-    total = score_call + score_put
-
-    if total < 3:
+    if total == 0:
         signal = "WAIT"
         confidence = 0
-        explanation = "Mixed or insufficient chart evidence."
-
-    elif score_call > score_put:
-        confidence = min(
-            95,
-            60 + (score_call - score_put) * 8
-        )
-
+    elif bullish > bearish:
         signal = "CALL"
-
-        explanation = (
-            "Relative chart momentum is bullish; "
-            "waiting for stronger confirmation before entry."
-        )
-
-    elif score_put > score_call:
-        confidence = min(
-            95,
-            60 + (score_put - score_call) * 8
-        )
-
+        confidence = int(55 + (bullish / 5.0) * 30)
+    elif bearish > bullish:
         signal = "PUT"
-
-        explanation = (
-            "Relative chart momentum is bearish; "
-            "waiting for stronger confirmation before entry."
-        )
-
+        confidence = int(55 + (bearish / 5.0) * 30)
     else:
         signal = "WAIT"
-        confidence = 0
-        explanation = "Signals are balanced."
+        confidence = 50
 
-    # Do not allow a trade signal from weak evidence.
-    if confidence < 78:
+    confidence = max(0, min(95, confidence))
+
+    if signal != "WAIT" and confidence < 78:
         signal = "WAIT"
-        explanation = (
-            "Chart detected, but confirmation threshold "
-            "has not been reached."
+
+    if signal == "CALL":
+        analysis = (
+            "Bullish alignment detected: EMA structure, momentum and "
+            "oscillator conditions are supporting CALL."
+        )
+    elif signal == "PUT":
+        analysis = (
+            "Bearish alignment detected: EMA structure, momentum and "
+            "oscillator conditions are supporting PUT."
+        )
+    else:
+        analysis = (
+            "Conditions are mixed or below the 78% confirmation threshold. "
+            "ALUCARD is waiting."
         )
 
     return {
         "signal": signal,
-        "confidence": int(confidence),
-
-        "ema9": round(e9, 6),
-        "ema20": round(e20, 6),
-        "ema50": round(e50, 6),
-
-        "rsi": round(r, 2),
-        "cci": round(c, 2),
-        "atr": round(a, 6),
-
-        "analysis": explanation
+        "confidence": confidence,
+        "price": price,
+        "ema9": ema9,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "cci": cci,
+        "atr": atr,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "analysis": analysis
     }
 
 
-# ============================================================
-# PROCESS IMAGE
-# ============================================================
+def update_state_from_candles(candles, asset="UNKNOWN"):
+    result = analyze_candles(candles)
 
-def process_image(data):
+    with STATE_LOCK:
+        STATE["asset"] = asset or STATE["asset"]
+        STATE["candles"] = len(candles)
+        STATE["signal"] = result.get("signal", "WAIT")
+        STATE["confidence"] = result.get("confidence", 0)
+        STATE["price"] = clean_float(result.get("price"))
 
-    global candle_history
+        STATE["ema9"] = clean_float(result.get("ema9"))
+        STATE["ema20"] = clean_float(result.get("ema20"))
+        STATE["ema50"] = clean_float(result.get("ema50"))
+        STATE["rsi"] = clean_float(result.get("rsi"))
+        STATE["cci"] = clean_float(result.get("cci"))
+        STATE["atr"] = clean_float(result.get("atr"))
+        STATE["macd"] = clean_float(result.get("macd"))
+        STATE["macd_signal"] = clean_float(result.get("macd_signal"))
 
-    try:
-        image = Image.open(
-            io.BytesIO(data)
+        STATE["entry"] = STATE["price"]
+        STATE["analysis"] = result.get(
+            "analysis",
+            "Analysis waiting..."
         )
 
+        STATE["feed"] = "LIVE"
+        STATE["updated"] = time.time()
+
+
+# ============================================================
+# SCREEN FRAME RECEIVER
+# ============================================================
+
+@app.route("/api/frame", methods=["POST"])
+def receive_frame():
+    global LAST_IMAGE
+
+    if not valid_token(request):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
+
+    raw = request.get_data()
+
+    # Also allow multipart uploads.
+    if not raw and request.files:
+        uploaded = next(iter(request.files.values()), None)
+
+        if uploaded:
+            raw = uploaded.read()
+
+    if not raw:
+        return jsonify({
+            "ok": False,
+            "error": "No image received"
+        }), 400
+
+    try:
+        image = Image.open(io.BytesIO(raw))
         image.load()
 
-    except Exception:
-        return False
+        width, height = image.size
 
-    values = image_to_candle_series(image)
+        LAST_IMAGE = raw
 
-    with lock:
+        with STATE_LOCK:
+            STATE["feed"] = "LIVE"
+            STATE["image_received"] = True
+            STATE["frame_bytes"] = len(raw)
+            STATE["last_frame"] = now_utc()
+            STATE["updated"] = time.time()
 
-        state["image_received"] = True
-        state["candles"] = len(values)
+            # Keep existing structured values if available.
+            if STATE["analysis"].startswith("Waiting for"):
+                STATE["analysis"] = (
+                    "LIVE screen feed received. "
+                    "Waiting for structured candle/price data."
+                )
 
-        if values:
-
-            candle_history = values
-
-            analysis = analyze_series(values)
-
-            state.update(analysis)
-
-            # The screenshot gives relative movement,
-            # not a verified broker price.
-            state["price"] = 0.0
-            state["entry"] = 0.0
-
-            if state["signal"] == "WAIT":
-                state["entry_window"] = 12
-            else:
-                state["entry_window"] = 12
-
-        else:
-
-            state["signal"] = "WAIT"
-            state["confidence"] = 0
-
-            state["analysis"] = (
-                "Live screen received. "
-                "Chart candles not yet detected."
-            )
-
-            state["price"] = 0.0
-            state["entry"] = 0.0
-
-    return True
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.route("/health", methods=["GET"])
-def health():
-
-    update_status()
-
-    with lock:
         return jsonify({
             "ok": True,
-            "service": "Alucard V2.1",
-            "feed": state["feed"],
-            "connected": state["connected"],
-            "frames": state["frame_count"]
+            "message": "Frame accepted",
+            "width": width,
+            "height": height,
+            "bytes": len(raw),
+            "feed": "LIVE",
+            "image_received": True,
+            "state": public_state()
         })
+
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid image",
+            "detail": str(exc)
+        }), 400
+
+
+# ============================================================
+# JSON FEED RECEIVER
+# ============================================================
+
+@app.route("/api/feed", methods=["POST"])
+def receive_feed():
+    if not valid_token(request):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "No JSON data received"
+        }), 400
+
+    asset = (
+        data.get("asset")
+        or data.get("symbol")
+        or data.get("pair")
+        or "UNKNOWN"
+    )
+
+    # --------------------------------------------------------
+    # Direct values
+    # --------------------------------------------------------
+
+    price = clean_float(
+        data.get("price")
+        or data.get("close")
+    )
+
+    signal = str(
+        data.get("signal")
+        or data.get("direction")
+        or "WAIT"
+    ).upper()
+
+    if signal not in ("CALL", "PUT", "WAIT"):
+        signal = "WAIT"
+
+    confidence = clean_int(
+        data.get("confidence"),
+        0
+    )
+
+    candles = data.get("candles")
+
+    # --------------------------------------------------------
+    # Structured candle list
+    # --------------------------------------------------------
+
+    if isinstance(candles, list) and candles:
+
+        normalized = []
+
+        for c in candles:
+            if not isinstance(c, dict):
+                continue
+
+            normalized.append({
+                "open": clean_float(c.get("open")),
+                "high": clean_float(c.get("high")),
+                "low": clean_float(c.get("low")),
+                "close": clean_float(c.get("close"))
+            })
+
+        if normalized:
+            update_state_from_candles(
+                normalized,
+                asset
+            )
+
+    # --------------------------------------------------------
+    # Direct feed values override / supplement analysis.
+    # --------------------------------------------------------
+
+    with STATE_LOCK:
+        STATE["feed"] = "LIVE"
+        STATE["asset"] = asset
+
+        if price > 0:
+            STATE["price"] = price
+            STATE["entry"] = clean_float(
+                data.get("entry"),
+                price
+            )
+
+        if "confidence" in data:
+            STATE["confidence"] = max(
+                0,
+                min(100, confidence)
+            )
+
+        if "signal" in data or "direction" in data:
+            STATE["signal"] = signal
+
+        if "entry_window" in data:
+            STATE["entry_window"] = clean_int(
+                data.get("entry_window"),
+                12
+            )
+
+        if "fractal" in data:
+            STATE["fractal"] = clean_int(
+                data.get("fractal"),
+                2
+            )
+
+        if "expiry" in data:
+            STATE["expiry"] = str(
+                data.get("expiry") or "5m"
+            )
+
+        # Direct indicator values if supplied.
+        indicator_map = {
+            "ema9": "ema9",
+            "ema20": "ema20",
+            "ema50": "ema50",
+            "rsi": "rsi",
+            "cci": "cci",
+            "atr": "atr",
+            "macd": "macd",
+            "macd_signal": "macd_signal",
+            "sar": "sar"
+        }
+
+        for incoming, state_key in indicator_map.items():
+            if incoming in data:
+                STATE[state_key] = clean_float(
+                    data.get(incoming)
+                )
+
+        if "analysis" in data:
+            STATE["analysis"] = str(
+                data.get("analysis") or ""
+            )
+
+        STATE["last_frame"] = now_utc()
+        STATE["image_received"] = bool(
+            data.get("image_received", STATE["image_received"])
+        )
+        STATE["updated"] = time.time()
+
+        if not STATE["analysis"]:
+            STATE["analysis"] = (
+                "Live market data received."
+            )
+
+    return jsonify({
+        "ok": True,
+        "message": "JSON feed accepted",
+        "state": public_state()
+    })
+
+
+# ============================================================
+# OPTIONAL COMBINED ENDPOINT
+# ============================================================
+
+@app.route("/api/frame-json", methods=["POST"])
+def receive_frame_json():
+    """
+    Allows a bridge to send:
+    {
+        asset: "...",
+        price: ...,
+        candles: [...],
+        image: optional base64 data
+    }
+
+    This endpoint primarily handles JSON.
+    """
+
+    if not valid_token(request):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "No JSON data received"
+        }), 400
+
+    # Reuse normal feed processing.
+    asset = data.get("asset", "UNKNOWN")
+
+    candles = data.get("candles", [])
+
+    if isinstance(candles, list) and candles:
+        normalized = []
+
+        for c in candles:
+            if isinstance(c, dict):
+                normalized.append({
+                    "open": clean_float(c.get("open")),
+                    "high": clean_float(c.get("high")),
+                    "low": clean_float(c.get("low")),
+                    "close": clean_float(c.get("close"))
+                })
+
+        if normalized:
+            update_state_from_candles(
+                normalized,
+                asset
+            )
+
+    with STATE_LOCK:
+        if data.get("price") is not None:
+            STATE["price"] = clean_float(
+                data.get("price")
+            )
+
+        if data.get("signal"):
+            s = str(data.get("signal")).upper()
+            if s in ("CALL", "PUT", "WAIT"):
+                STATE["signal"] = s
+
+        if data.get("confidence") is not None:
+            STATE["confidence"] = max(
+                0,
+                min(
+                    100,
+                    clean_int(data.get("confidence"))
+                )
+            )
+
+        STATE["feed"] = "LIVE"
+        STATE["last_frame"] = now_utc()
+        STATE["updated"] = time.time()
+
+    return jsonify({
+        "ok": True,
+        "message": "Combined feed accepted",
+        "state": public_state()
+    })
 
 
 # ============================================================
 # STATE
 # ============================================================
 
+def public_state():
+    with STATE_LOCK:
+        state = dict(STATE)
+
+    # Never expose internal timestamp.
+    state.pop("updated", None)
+
+    return state
+
+
 @app.route("/api/state", methods=["GET"])
 def api_state():
+    # Feed timeout.
+    with STATE_LOCK:
+        last_update = STATE.get("updated", 0)
 
-    update_status()
+    if last_update:
+        age = time.time() - last_update
 
-    with lock:
-        result = dict(state)
+        if age > 15:
+            with STATE_LOCK:
+                STATE["feed"] = "DISCONNECTED"
 
-    return jsonify(result)
-
-
-@app.route("/api/status", methods=["GET"])
-def api_status():
-
-    update_status()
-
-    with lock:
-        return jsonify({
-            "feed": state["feed"],
-            "connected": state["connected"],
-            "image_received": state["image_received"],
-            "frame_count": state["frame_count"],
-            "last_frame": state["last_frame"]
-        })
+    return jsonify(public_state())
 
 
-# ============================================================
-# IMAGE FRAME RECEIVER
-# ============================================================
-
-@app.route("/api/frame", methods=["POST"])
-def receive_frame():
-
-    global latest_frame
-
-    data = None
-
-    # Raw image body.
-    if request.data:
-        data = request.data
-
-    # Multipart uploads.
-    if not data and request.files:
-
-        for name in [
-            "frame",
-            "image",
-            "file",
-            "screenshot"
-        ]:
-
-            if name in request.files:
-                data = request.files[name].read()
-                break
-
-        if not data:
-            first = next(
-                iter(request.files.values())
-            )
-
-            data = first.read()
-
-    if not data:
-
-        return jsonify({
-            "ok": False,
-            "error": "No image/frame received"
-        }), 400
-
-    # Verify image.
-    try:
-
-        test = Image.open(
-            io.BytesIO(data)
-        )
-
-        test.verify()
-
-    except Exception:
-
-        return jsonify({
-            "ok": False,
-            "error": "Invalid image"
-        }), 400
-
-    now = time.time()
-    stamp = utc_text()
-
-    with lock:
-
-        latest_frame = data
-
-        state["feed"] = "LIVE"
-        state["connected"] = True
-        state["image_received"] = True
-        state["last_update"] = now
-        state["last_frame"] = stamp
-        state["frame_count"] += 1
-
-    # Analyze outside the state lock.
-    process_image(data)
-
+@app.route("/api/health", methods=["GET"])
+def health():
     return jsonify({
         "ok": True,
-        "message": "Screen frame accepted",
-        "feed": "LIVE",
-        "connected": True,
-        "image_received": True,
-        "last_frame": stamp,
-        "frame_count": state["frame_count"]
+        "service": "ALUCARD V2.1",
+        "feed": public_state()["feed"],
+        "time": now_utc()
+    })
+
+
+@app.route("/health", methods=["GET"])
+def health_short():
+    return jsonify({
+        "ok": True,
+        "service": "ALUCARD V2.1"
     })
 
 
 # ============================================================
-# JSON FEED COMPATIBILITY
+# SCREEN IMAGE
 # ============================================================
 
-@app.route("/api/feed", methods=["POST"])
-def receive_feed():
+@app.route("/api/latest-frame", methods=["GET"])
+def latest_frame():
+    global LAST_IMAGE
 
-    payload = request.get_json(
-        silent=True
-    )
-
-    if not payload:
-
-        return jsonify({
-            "ok": False,
-            "error": "No JSON data received"
-        }), 400
-
-    now = time.time()
-
-    with lock:
-
-        if "asset" in payload:
-            state["asset"] = str(
-                payload["asset"]
-            )
-
-        for key in [
-            "price",
-            "confidence",
-            "entry",
-            "entry_window",
-            "candles",
-            "fractal",
-            "ema9",
-            "ema20",
-            "ema50",
-            "rsi",
-            "cci",
-            "atr"
-        ]:
-
-            if key in payload:
-                state[key] = payload[key]
-
-        if "signal" in payload:
-            state["signal"] = str(
-                payload["signal"]
-            )
-
-        if "analysis" in payload:
-            state["analysis"] = str(
-                payload["analysis"]
-            )
-
-        state["feed"] = "LIVE"
-        state["connected"] = True
-        state["image_received"] = False
-        state["last_update"] = now
-        state["last_frame"] = utc_text()
-
-    return jsonify({
-        "ok": True,
-        "message": "JSON feed accepted",
-        "state": dict(state)
-    })
-
-
-# ============================================================
-# IMAGE VIEW
-# ============================================================
-
-@app.route("/api/frame.jpg", methods=["GET"])
-def frame_jpg():
-
-    update_status()
-
-    with lock:
-        frame = latest_frame
-
-    if not frame:
-
+    if LAST_IMAGE is None:
         return jsonify({
             "ok": False,
             "error": "No frame available"
         }), 404
 
-    return Response(
-        frame,
-        mimetype="image/jpeg",
-        headers={
-            "Cache-Control":
-                "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache"
+    return (
+        LAST_IMAGE,
+        200,
+        {
+            "Content-Type": "image/jpeg",
+            "Cache-Control": "no-store"
         }
     )
 
 
-@app.route("/api/screen/latest", methods=["GET"])
-def screen_latest():
-
-    return frame_jpg()
-
-
 # ============================================================
-# DASHBOARD
+# MAIN DASHBOARD
 # ============================================================
 
-@app.route("/", methods=["GET"])
-def dashboard():
-
-    html = r"""
-<!DOCTYPE html>
+HTML = r"""
+<!doctype html>
 <html>
 <head>
-
+<meta charset="utf-8">
 <meta name="viewport"
       content="width=device-width,initial-scale=1">
 
 <title>ALUCARD V2.1</title>
 
 <style>
-
 * {
-    box-sizing:border-box;
+    box-sizing: border-box;
 }
 
 body {
-    margin:0;
-    background:#050505;
-    color:#eee;
-    font-family:Arial,sans-serif;
+    margin: 0;
+    background:
+        radial-gradient(circle at top, #24152c 0%, #09080d 55%, #030306 100%);
+    color: #eee;
+    font-family: Arial, Helvetica, sans-serif;
 }
 
 .header {
-    text-align:center;
-    padding:18px 10px 10px;
-    border-bottom:1px solid #282828;
+    padding: 18px 14px 10px;
+    text-align: center;
+    border-bottom: 1px solid #3d2947;
 }
 
 .title {
-    font-size:30px;
-    font-weight:900;
-    letter-spacing:5px;
+    font-size: 28px;
+    font-weight: 900;
+    letter-spacing: 5px;
+    color: #eee;
 }
 
 .subtitle {
-    color:#888;
-    font-size:13px;
-    margin-top:5px;
-    letter-spacing:1px;
-}
-
-.tabs {
-    display:flex;
-    justify-content:center;
-    gap:5px;
-    padding:10px;
-    border-bottom:1px solid #222;
-}
-
-.tab {
-    padding:9px 12px;
-    border:1px solid #333;
-    border-radius:6px;
-    color:#aaa;
-    font-size:12px;
-}
-
-.tab.active {
-    color:#fff;
-    border-color:#666;
+    margin-top: 5px;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: #a68caf;
 }
 
 .status {
-    margin:12px;
-    padding:12px;
-    border:1px solid #333;
-    border-radius:7px;
-    text-align:center;
-    font-weight:bold;
+    margin: 12px auto;
+    width: 94%;
+    padding: 11px;
+    border-radius: 9px;
+    background: #151118;
+    border: 1px solid #3d2947;
+    font-size: 13px;
 }
 
 .live {
-    color:#00ff66;
+    color: #7dffb2;
+    font-weight: 900;
 }
 
 .dead {
-    color:#ff4444;
+    color: #ff6d7d;
+    font-weight: 900;
 }
 
-.last {
-    text-align:center;
-    color:#888;
-    font-size:12px;
-    margin-bottom:12px;
+.tabs {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 5px;
+    padding: 8px;
 }
 
-.section {
-    margin:12px;
-    color:#999;
-    font-size:12px;
+.tab {
+    background: #161119;
+    border: 1px solid #38243f;
+    border-radius: 7px;
+    padding: 10px 3px;
+    text-align: center;
+    font-size: 11px;
+}
+
+.tab:first-child {
+    border-color: #9d54c6;
+}
+
+.assetbox {
+    padding: 8px 14px;
 }
 
 select {
-    width:calc(100% - 24px);
-    margin:0 12px 12px;
-    padding:12px;
-    background:#111;
-    color:#fff;
-    border:1px solid #333;
-    border-radius:7px;
+    width: 100%;
+    padding: 12px;
+    background: #111016;
+    color: white;
+    border: 1px solid #59366a;
+    border-radius: 8px;
+    font-size: 15px;
 }
 
 .grid {
-    display:grid;
-    grid-template-columns:repeat(2,1fr);
-    gap:9px;
-    padding:12px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 9px;
+    padding: 10px 14px;
 }
 
 .card {
-    background:#101010;
-    border:1px solid #292929;
-    border-radius:7px;
-    padding:13px;
+    background: rgba(17,15,21,.96);
+    border: 1px solid #302438;
+    border-radius: 10px;
+    padding: 13px;
+    min-height: 75px;
 }
 
 .label {
-    color:#777;
-    font-size:11px;
+    font-size: 10px;
+    color: #967d9f;
+    letter-spacing: 1px;
+    margin-bottom: 7px;
 }
 
 .value {
-    margin-top:6px;
-    font-size:21px;
-    font-weight:bold;
+    font-size: 21px;
+    font-weight: 900;
 }
 
 .signal {
-    grid-column:span 2;
-    text-align:center;
+    grid-column: span 2;
+    text-align: center;
+    min-height: 100px;
 }
 
 .signal .value {
-    font-size:34px;
+    font-size: 34px;
+    letter-spacing: 3px;
 }
 
-.screen {
-    margin:12px;
-    border:1px solid #333;
-    border-radius:7px;
-    overflow:hidden;
-    background:#000;
+.wait {
+    color: #d0b9d7;
 }
 
-.screen img {
-    width:100%;
-    display:block;
+.call {
+    color: #69ffad;
+}
+
+.put {
+    color: #ff6575;
 }
 
 .analysis {
-    margin:12px;
-    padding:14px;
-    border:1px solid #333;
-    background:#101010;
-    border-radius:7px;
+    margin: 5px 14px 15px;
+    padding: 14px;
+    background: #100d13;
+    border: 1px solid #302438;
+    border-radius: 10px;
+    line-height: 1.45;
+    font-size: 13px;
+    color: #cbbbd0;
 }
 
-.analysisText {
-    margin-top:7px;
-    line-height:1.4;
+.footer {
+    padding: 14px;
+    text-align: center;
+    color: #66556c;
+    font-size: 10px;
 }
-
 </style>
-
 </head>
 
 <body>
 
 <div class="header">
-
-<div class="title">ALUCARD</div>
-
-<div class="subtitle">
-GOTHIC MARKET INTELLIGENCE — V2.1
+    <div class="title">ALUCARD</div>
+    <div class="subtitle">
+        GOTHIC MARKET INTELLIGENCE — V2.1
+    </div>
 </div>
 
+<div class="status">
+    Feed:
+    <span id="feed" class="dead">DISCONNECTED</span>
+    &nbsp; | &nbsp;
+    Asset:
+    <span id="asset">UNKNOWN</span>
+    <br>
+    <small>
+        Last frame:
+        <span id="lastFrame">Waiting...</span>
+    </small>
 </div>
 
 <div class="tabs">
-
-<div class="tab active">Signals</div>
-<div class="tab">Trades</div>
-<div class="tab">Performance</div>
-<div class="tab">Settings</div>
-
+    <div class="tab">Signals</div>
+    <div class="tab">Trades</div>
+    <div class="tab">Performance</div>
+    <div class="tab">Settings</div>
 </div>
 
-<div id="status"
-     class="status dead">
-Feed: DISCONNECTED
+<div class="assetbox">
+    <select id="assetSelect">
+        <option>EURUSD</option>
+        <option>GBPUSD</option>
+        <option>USDJPY</option>
+        <option>USDCHF</option>
+        <option>AUDUSD</option>
+        <option>USDCAD</option>
+        <option>NZDUSD</option>
+
+        <option>EURGBP</option>
+        <option>EURJPY</option>
+        <option>GBPJPY</option>
+        <option>GBPCHF</option>
+        <option>AUDJPY</option>
+        <option>CADJPY</option>
+
+        <option>EURUSD OTC</option>
+        <option>GBPUSD OTC</option>
+        <option>USDJPY OTC</option>
+        <option>EURJPY OTC</option>
+        <option>GBPJPY OTC</option>
+        <option>AUDUSD OTC</option>
+
+        <option>BTCUSD</option>
+        <option>ETHUSD</option>
+        <option>LTCUSD</option>
+        <option>XRPUSD</option>
+
+        <option>GOLD</option>
+        <option>SILVER</option>
+        <option>OIL</option>
+        <option>NATURAL GAS</option>
+
+        <option>AAPL</option>
+        <option>TSLA</option>
+        <option>AMZN</option>
+        <option>MSFT</option>
+        <option>GOOGL</option>
+        <option>NVDA</option>
+
+        <option>US30</option>
+        <option>NAS100</option>
+        <option>SP500</option>
+    </select>
 </div>
-
-<div id="last"
-     class="last">
-WAITING — last frame: none
-</div>
-
-<div class="section">
-Currency / Asset
-</div>
-
-<select id="assetSelect">
-
-<option>EURUSD</option>
-<option>GBPUSD</option>
-<option>USDJPY</option>
-<option>USDCHF</option>
-<option>USDCAD</option>
-<option>AUDUSD</option>
-<option>NZDUSD</option>
-
-<option>EURGBP</option>
-<option>EURJPY</option>
-<option>GBPJPY</option>
-<option>EURCHF</option>
-<option>GBPCHF</option>
-
-<option>EURUSD OTC</option>
-<option>GBPUSD OTC</option>
-<option>USDJPY OTC</option>
-<option>EURJPY OTC</option>
-<option>GBPJPY OTC</option>
-
-<option>BTCUSD</option>
-<option>ETHUSD</option>
-<option>XRPUSD</option>
-
-<option>Gold</option>
-<option>Silver</option>
-<option>Oil</option>
-<option>Natural Gas</option>
-
-<option>AAPL</option>
-<option>TSLA</option>
-<option>AMZN</option>
-<option>MSFT</option>
-
-<option>SP500</option>
-<option>NASDAQ</option>
-<option>DOW</option>
-
-</select>
 
 <div class="grid">
 
-<div class="card signal">
-<div class="label">SIGNAL</div>
-<div id="signal" class="value">WAIT</div>
-</div>
+    <div class="card signal">
+        <div class="label">SIGNAL</div>
+        <div id="signal" class="value wait">WAIT</div>
+    </div>
 
-<div class="card">
-<div class="label">PRICE</div>
-<div id="price" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">PRICE</div>
+        <div id="price" class="value">0.000000</div>
+    </div>
 
-<div class="card">
-<div class="label">CONFIDENCE</div>
-<div id="confidence" class="value">0%</div>
-</div>
+    <div class="card">
+        <div class="label">CONFIDENCE</div>
+        <div id="confidence" class="value">0%</div>
+    </div>
 
-<div class="card">
-<div class="label">ENTRY</div>
-<div id="entry" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">ENTRY</div>
+        <div id="entry" class="value">0.000000</div>
+    </div>
 
-<div class="card">
-<div class="label">ENTRY WINDOW</div>
-<div id="window" class="value">12s</div>
-</div>
+    <div class="card">
+        <div class="label">ENTRY WINDOW</div>
+        <div id="entryWindow" class="value">12s</div>
+    </div>
 
-<div class="card">
-<div class="label">CANDLES</div>
-<div id="candles" class="value">0</div>
-</div>
+    <div class="card">
+        <div class="label">CANDLES</div>
+        <div id="candles" class="value">0</div>
+    </div>
 
-<div class="card">
-<div class="label">FRACTAL</div>
-<div id="fractal" class="value">2</div>
-</div>
+    <div class="card">
+        <div class="label">FRACTAL</div>
+        <div id="fractal" class="value">2</div>
+    </div>
 
-<div class="card">
-<div class="label">EXPIRY</div>
-<div id="expiry" class="value">5m</div>
-</div>
+    <div class="card">
+        <div class="label">EXPIRY</div>
+        <div id="expiry" class="value">5m</div>
+    </div>
 
-<div class="card">
-<div class="label">EMA 9</div>
-<div id="ema9" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">EMA 9</div>
+        <div id="ema9" class="value">0.000000</div>
+    </div>
 
-<div class="card">
-<div class="label">EMA 20</div>
-<div id="ema20" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">EMA 20</div>
+        <div id="ema20" class="value">0.000000</div>
+    </div>
 
-<div class="card">
-<div class="label">EMA 50</div>
-<div id="ema50" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">EMA 50</div>
+        <div id="ema50" class="value">0.000000</div>
+    </div>
 
-<div class="card">
-<div class="label">RSI</div>
-<div id="rsi" class="value">0.00</div>
-</div>
+    <div class="card">
+        <div class="label">RSI</div>
+        <div id="rsi" class="value">0.00</div>
+    </div>
 
-<div class="card">
-<div class="label">CCI</div>
-<div id="cci" class="value">0.00</div>
-</div>
+    <div class="card">
+        <div class="label">CCI</div>
+        <div id="cci" class="value">0.00</div>
+    </div>
 
-<div class="card">
-<div class="label">ATR</div>
-<div id="atr" class="value">0.000000</div>
-</div>
+    <div class="card">
+        <div class="label">ATR</div>
+        <div id="atr" class="value">0.00</div>
+    </div>
 
-</div>
+    <div class="card">
+        <div class="label">MACD</div>
+        <div id="macd" class="value">0.00</div>
+    </div>
 
-<div class="screen">
-
-<img id="screenImage"
-     src="/api/frame.jpg"
-     onerror="this.style.display='none';">
+    <div class="card">
+        <div class="label">SAR</div>
+        <div id="sar" class="value">0.00</div>
+    </div>
 
 </div>
 
 <div class="analysis">
-
-<div class="label">
-LIVE ANALYSIS
+    <b>ALUCARD ANALYSIS</b>
+    <br><br>
+    <span id="analysis">
+        Waiting for screen feed...
+    </span>
 </div>
 
-<div id="analysis"
-     class="analysisText">
-Waiting for screen feed...
-</div>
-
+<div class="footer">
+    ALUCARD V2.1 • SCREEN FEED INTELLIGENCE
 </div>
 
 <script>
 
-async function updateDashboard() {
+function fmt(x, digits=6) {
+    let n = Number(x || 0);
 
-    try {
+    if (!Number.isFinite(n)) {
+        n = 0;
+    }
 
-        const response =
-            await fetch(
-                "/api/state?t=" +
-                Date.now(),
-                {
-                    cache:"no-store"
-                }
-            );
+    return n.toFixed(digits);
+}
 
-        const d =
-            await response.json();
+function setText(id, value) {
+    const el = document.getElementById(id);
 
-        const status =
-            document.getElementById(
-                "status"
-            );
-
-        const last =
-            document.getElementById(
-                "last"
-            );
-
-        if (d.feed === "LIVE") {
-
-            status.innerText =
-                "Feed: LIVE   |   Asset: " +
-                (d.asset || "UNKNOWN");
-
-            status.className =
-                "status live";
-
-            last.innerText =
-                "LIVE — last frame: " +
-                (d.last_frame || "unknown");
-
-        } else {
-
-            status.innerText =
-                "Feed: DISCONNECTED   |   Asset: " +
-                (d.asset || "UNKNOWN");
-
-            status.className =
-                "status dead";
-
-            last.innerText =
-                "WAITING — last frame: " +
-                (d.last_frame || "none");
-        }
-
-        document.getElementById(
-            "signal"
-        ).innerText =
-            d.signal || "WAIT";
-
-        document.getElementById(
-            "price"
-        ).innerText =
-            Number(d.price || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "confidence"
-        ).innerText =
-            (d.confidence || 0) + "%";
-
-        document.getElementById(
-            "entry"
-        ).innerText =
-            Number(d.entry || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "window"
-        ).innerText =
-            (d.entry_window || 12) + "s";
-
-        document.getElementById(
-            "candles"
-        ).innerText =
-            d.candles || 0;
-
-        document.getElementById(
-            "fractal"
-        ).innerText =
-            d.fractal || 2;
-
-        document.getElementById(
-            "expiry"
-        ).innerText =
-            d.expiry || "5m";
-
-        document.getElementById(
-            "ema9"
-        ).innerText =
-            Number(d.ema9 || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "ema20"
-        ).innerText =
-            Number(d.ema20 || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "ema50"
-        ).innerText =
-            Number(d.ema50 || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "rsi"
-        ).innerText =
-            Number(d.rsi || 0)
-            .toFixed(2);
-
-        document.getElementById(
-            "cci"
-        ).innerText =
-            Number(d.cci || 0)
-            .toFixed(2);
-
-        document.getElementById(
-            "atr"
-        ).innerText =
-            Number(d.atr || 0)
-            .toFixed(6);
-
-        document.getElementById(
-            "analysis"
-        ).innerText =
-            d.analysis ||
-            "Waiting for screen feed...";
-
-        if (d.image_received) {
-
-            const img =
-                document.getElementById(
-                    "screenImage"
-                );
-
-            img.style.display =
-                "block";
-
-            img.src =
-                "/api/frame.jpg?t=" +
-                Date.now();
-        }
-
-    } catch (error) {
-
-        const status =
-            document.getElementById(
-                "status"
-            );
-
-        status.innerText =
-            "Feed: DISCONNECTED";
-
-        status.className =
-            "status dead";
+    if (el) {
+        el.textContent = value;
     }
 }
 
-updateDashboard();
+async function update() {
+
+    try {
+
+        const response = await fetch(
+            "/api/state?ts=" + Date.now(),
+            {
+                cache: "no-store"
+            }
+        );
+
+        const s = await response.json();
+
+        const feed = String(
+            s.feed || "DISCONNECTED"
+        ).toUpperCase();
+
+        setText("feed", feed);
+
+        const feedEl = document.getElementById("feed");
+
+        feedEl.className =
+            feed === "LIVE"
+            ? "live"
+            : "dead";
+
+        setText(
+            "asset",
+            s.asset || "UNKNOWN"
+        );
+
+        setText(
+            "lastFrame",
+            s.last_frame || "Waiting..."
+        );
+
+        const signal =
+            String(s.signal || "WAIT").toUpperCase();
+
+        const signalEl =
+            document.getElementById("signal");
+
+        signalEl.textContent = signal;
+
+        signalEl.className =
+            "value " +
+            (
+                signal === "CALL"
+                ? "call"
+                : signal === "PUT"
+                ? "put"
+                : "wait"
+            );
+
+        setText(
+            "price",
+            fmt(s.price)
+        );
+
+        setText(
+            "confidence",
+            Math.round(Number(s.confidence || 0)) + "%"
+        );
+
+        setText(
+            "entry",
+            fmt(s.entry)
+        );
+
+        setText(
+            "entryWindow",
+            (s.entry_window || 12) + "s"
+        );
+
+        setText(
+            "candles",
+            s.candles || 0
+        );
+
+        setText(
+            "fractal",
+            s.fractal || 2
+        );
+
+        setText(
+            "expiry",
+            s.expiry || "5m"
+        );
+
+        setText(
+            "ema9",
+            fmt(s.ema9)
+        );
+
+        setText(
+            "ema20",
+            fmt(s.ema20)
+        );
+
+        setText(
+            "ema50",
+            fmt(s.ema50)
+        );
+
+        setText(
+            "rsi",
+            fmt(s.rsi, 2)
+        );
+
+        setText(
+            "cci",
+            fmt(s.cci, 2)
+        );
+
+        setText(
+            "atr",
+            fmt(s.atr, 6)
+        );
+
+        setText(
+            "macd",
+            fmt(s.macd, 6)
+        );
+
+        setText(
+            "sar",
+            fmt(s.sar, 6)
+        );
+
+        setText(
+            "analysis",
+            s.analysis || "Waiting for analysis..."
+        );
+
+    } catch (error) {
+
+        setText(
+            "feed",
+            "DISCONNECTED"
+        );
+
+        document.getElementById(
+            "feed"
+        ).className = "dead";
+    }
+}
+
+update();
 
 setInterval(
-    updateDashboard,
-    2000
+    update,
+    1000
 );
 
 </script>
@@ -1267,48 +1280,18 @@ setInterval(
 </html>
 """
 
-    return Response(
-        html,
-        mimetype="text/html"
-    )
+
+@app.route("/", methods=["GET"])
+def dashboard():
+    return render_template_string(HTML)
 
 
 # ============================================================
-# BACKGROUND FEED WATCHDOG
-# ============================================================
-
-def watchdog():
-
-    while True:
-
-        try:
-            update_status()
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-
-threading.Thread(
-    target=watchdog,
-    daemon=True
-).start()
-
-
-# ============================================================
-# LOCAL RUN
+# STARTUP
 # ============================================================
 
 if __name__ == "__main__":
-
-    import os
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
-    )
+    port = int(os.environ.get("PORT", "5000"))
 
     app.run(
         host="0.0.0.0",
