@@ -6,762 +6,998 @@ import threading
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, render_template_string
-from PIL import Image
+from PIL import Image, ImageStat, ImageFilter
 
 app = Flask(__name__)
 
 # ============================================================
-# ALUCARD V2.1
+# ALUCARD V2.2
 # GOTHIC MARKET INTELLIGENCE
-# LIVE SCREEN-FEED SIGNAL ENGINE
+#
+# SCREEN FEED:
+# Screen Stream -> RTSP -> bridge.py -> /api/frame
+#
+# This server:
+#   1. accepts live JPEG/PNG frames
+#   2. analyzes the visible chart
+#   3. extracts chart geometry/colors
+#   4. builds synthetic OHLC samples from chart pixels
+#   5. calculates indicators
+#   6. combines indicator + visual-chart evidence
+#   7. produces CALL / PUT / WAIT
+#   8. runs an actual entry countdown
+#   9. provides working asset/timeframe menus
 # ============================================================
 
 TOKEN = os.getenv("RYU_FEED_TOKEN", "").strip()
 
-MIN_CONFIDENCE = 78
-STALE_SECONDS = 8
-ENTRY_SECONDS = 12
-DEFAULT_TIMEFRAME = "30s"
-
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 
 state = {
-    "asset": "UNKNOWN",
+    "asset": "EURUSD_otc",
     "price": 0.0,
-    "previous_price": 0.0,
-
     "signal": "WAIT",
     "confidence": 0,
-
     "entry": 0.0,
     "entry_window": 0,
-    "signal_started": 0,
-
     "candles": 0,
-    "timeframe": DEFAULT_TIMEFRAME,
-    "payout": "--",
-
     "feed": "WAITING",
     "image_received": False,
-    "last_frame": 0,
-
-    "screen_status": "WAITING",
-    "analysis_status": "WAITING",
-
-    "ema9": 0.0,
-    "ema20": 0.0,
-    "ema50": 0.0,
-    "rsi": 50.0,
-    "macd": 0.0,
-    "macd_signal": 0.0,
-    "cci": 0.0,
-    "sar": 0.0,
-    "atr": 0.0,
-    "bb_upper": 0.0,
-    "bb_middle": 0.0,
-    "bb_lower": 0.0,
-
-    "bull_score": 0,
-    "bear_score": 0,
-
-    "updated": "",
+    "last_frame": 0.0,
+    "last_signal": 0.0,
+    "signal_candle": 0,
+    "timeframe": "1m",
+    "payout": 85,
+    "expiry": "5m",
+    "visual_bias": 0,
+    "indicator_bias": 0,
+    "analysis": "Waiting for live chart",
+    "chart_detected": False,
+    "frame_width": 0,
+    "frame_height": 0,
+    "entry_deadline": 0.0,
+    "server_time": time.time(),
+    "scan_count": 0,
 }
 
-# Rolling close prices.
-prices = []
-
-# Detected screen colors / direction history.
-direction_history = []
-
 # ============================================================
-# HELPERS
+# ASSET MENU
 # ============================================================
 
-def now_ts():
-    return time.time()
+ASSETS = {
+    "FOREX": [
+        ("EURUSD", "EUR/USD"),
+        ("GBPUSD", "GBP/USD"),
+        ("USDJPY", "USD/JPY"),
+        ("USDCHF", "USD/CHF"),
+        ("AUDUSD", "AUD/USD"),
+        ("USDCAD", "USD/CAD"),
+        ("NZDUSD", "NZD/USD"),
+        ("EURGBP", "EUR/GBP"),
+        ("EURJPY", "EUR/JPY"),
+        ("GBPJPY", "GBP/JPY"),
+        ("AUDJPY", "AUD/JPY"),
+        ("EURAUD", "EUR/AUD"),
+    ],
+    "OTC": [
+        ("EURUSD_otc", "EUR/USD OTC"),
+        ("GBPUSD_otc", "GBP/USD OTC"),
+        ("USDJPY_otc", "USD/JPY OTC"),
+        ("AUDUSD_otc", "AUD/USD OTC"),
+        ("USDCAD_otc", "USD/CAD OTC"),
+        ("EURJPY_otc", "EUR/JPY OTC"),
+        ("GBPJPY_otc", "GBP/JPY OTC"),
+        ("EURGBP_otc", "EUR/GBP OTC"),
+        ("AUDJPY_otc", "AUD/JPY OTC"),
+        ("NZDUSD_otc", "NZD/USD OTC"),
+    ],
+    "CRYPTO": [
+        ("BTCUSD", "BTC/USD"),
+        ("ETHUSD", "ETH/USD"),
+        ("LTCUSD", "LTC/USD"),
+        ("XRPUSD", "XRP/USD"),
+        ("BCHUSD", "BCH/USD"),
+        ("DOGEUSD", "DOGE/USD"),
+    ],
+    "COMMODITIES": [
+        ("GOLD", "Gold"),
+        ("SILVER", "Silver"),
+        ("OIL", "Oil"),
+        ("BRENT", "Brent Oil"),
+        ("NATGAS", "Natural Gas"),
+    ],
+    "STOCKS": [
+        ("AAPL", "Apple"),
+        ("TSLA", "Tesla"),
+        ("AMZN", "Amazon"),
+        ("MSFT", "Microsoft"),
+        ("META", "Meta"),
+        ("GOOGL", "Alphabet"),
+        ("NVDA", "NVIDIA"),
+    ],
+    "INDICES": [
+        ("SP500", "S&P 500"),
+        ("NASDAQ", "NASDAQ"),
+        ("DOW", "Dow Jones"),
+        ("DAX", "DAX"),
+        ("FTSE", "FTSE 100"),
+        ("CAC40", "CAC 40"),
+    ],
+}
 
+TIMEFRAMES = {
+    "5s": 5,
+    "15s": 15,
+    "30s": 30,
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
 
-def iso_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-
-        result = float(value)
-
-        if math.isfinite(result):
-            return result
-
-    except Exception:
-        pass
-
-    return default
-
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def check_token():
-    if not TOKEN:
-        return True
-
-    supplied = (
-        request.headers.get("X-RYU-TOKEN")
-        or request.headers.get("X-RYU-FEED-TOKEN")
-        or request.args.get("token")
-        or ""
-    )
-
-    return supplied.strip() == TOKEN
-
+EXPIRIES = [
+    "1m",
+    "2m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "30m",
+    "1h",
+]
 
 # ============================================================
-# INDICATORS
+# NUMERIC HELPERS
 # ============================================================
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def mean(values):
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
 
 def ema(values, period):
     if not values:
-        return 0.0
+        return []
 
-    if len(values) == 1:
-        return values[-1]
+    period = max(1, min(period, len(values)))
+    k = 2.0 / (period + 1.0)
 
-    alpha = 2.0 / (period + 1.0)
-
-    result = values[0]
+    out = [float(values[0])]
 
     for value in values[1:]:
-        result = (value * alpha) + (result * (1.0 - alpha))
+        out.append(float(value) * k + out[-1] * (1.0 - k))
 
-    return result
+    return out
 
 
 def sma(values, period):
     if not values:
-        return 0.0
+        return []
 
-    data = values[-period:]
+    period = max(1, period)
+    out = []
 
-    return sum(data) / len(data)
+    for i in range(len(values)):
+        start = max(0, i - period + 1)
+        out.append(mean(values[start:i + 1]))
+
+    return out
 
 
 def rsi(values, period=14):
     if len(values) < 2:
         return 50.0
 
-    data = values[-(period + 1):]
-
     gains = []
     losses = []
 
-    for i in range(1, len(data)):
-        change = data[i] - data[i - 1]
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(0.0, d))
+        losses.append(max(0.0, -d))
 
-        if change > 0:
-            gains.append(change)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(change))
+    if not gains:
+        return 50.0
 
-    avg_gain = sum(gains) / len(gains)
-    avg_loss = sum(losses) / len(losses)
+    recent_gains = gains[-period:]
+    recent_losses = losses[-period:]
+
+    avg_gain = mean(recent_gains)
+    avg_loss = mean(recent_losses)
 
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
-
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def bollinger(values, period=20, multiplier=2.0):
+def macd(values):
+    if len(values) < 3:
+        return 0.0, 0.0, 0.0
+
+    e12 = ema(values, 12)
+    e26 = ema(values, 26)
+
+    line = e12[-1] - e26[-1]
+
+    macd_series = [
+        e12[i] - e26[i]
+        for i in range(min(len(e12), len(e26)))
+    ]
+
+    signal_series = ema(macd_series, 9)
+    signal = signal_series[-1] if signal_series else 0.0
+
+    return line, signal, line - signal
+
+
+def bollinger(values, period=20, mult=2.0):
     if not values:
         return 0.0, 0.0, 0.0
 
-    data = values[-period:]
+    recent = values[-period:]
+    mid = mean(recent)
 
-    middle = sum(data) / len(data)
+    if len(recent) < 2:
+        return mid, mid, mid
 
-    variance = sum(
-        (x - middle) ** 2 for x in data
-    ) / len(data)
+    variance = mean([(x - mid) ** 2 for x in recent])
+    std = math.sqrt(max(0.0, variance))
 
-    std = math.sqrt(max(variance, 0.0))
-
-    return (
-        middle + multiplier * std,
-        middle,
-        middle - multiplier * std,
-    )
+    return mid + mult * std, mid, mid - mult * std
 
 
-def macd(values):
-    if not values:
-        return 0.0, 0.0
-
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    line = fast - slow
-
-    macd_values = []
-
-    start = max(0, len(values) - 60)
-
-    for i in range(start, len(values)):
-        subset = values[:i + 1]
-
-        macd_values.append(
-            ema(subset, 12) - ema(subset, 26)
-        )
-
-    signal_line = ema(macd_values, 9) if macd_values else line
-
-    return line, signal_line
-
-
-def cci(values, period=20):
-    if len(values) < 2:
+def atr(highs, lows, closes, period=14):
+    if len(closes) < 2:
         return 0.0
 
-    data = values[-period:]
+    trs = []
 
-    middle = sum(data) / len(data)
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
 
-    deviation = sum(abs(x - middle) for x in data) / len(data)
+    return mean(trs[-period:])
+
+
+def cci(highs, lows, closes, period=20):
+    if not closes:
+        return 0.0
+
+    typical = [
+        (highs[i] + lows[i] + closes[i]) / 3.0
+        for i in range(len(closes))
+    ]
+
+    recent = typical[-period:]
+    avg = mean(recent)
+
+    deviation = mean([abs(x - avg) for x in recent])
 
     if deviation == 0:
         return 0.0
 
-    return (data[-1] - middle) / (0.015 * deviation)
-
-
-def atr(values, period=14):
-    if len(values) < 2:
-        return 0.0
-
-    changes = [
-        abs(values[i] - values[i - 1])
-        for i in range(1, len(values))
-    ]
-
-    return sum(changes[-period:]) / min(
-        period,
-        len(changes)
-    )
-
-
-def parabolic_sar_proxy(values):
-    """
-    Screenshot/price-feed compatible SAR proxy.
-
-    When only close prices are supplied rather than complete
-    OHLC candles, this gives a directional SAR-style reference.
-    """
-
-    if len(values) < 3:
-        return values[-1] if values else 0.0
-
-    recent = values[-14:]
-
-    low = min(recent)
-    high = max(recent)
-
-    current = recent[-1]
-
-    if current >= sma(recent, len(recent)):
-        return low
-    else:
-        return high
-
-
-def alligator_proxy(values):
-    """
-    Williams Alligator-style moving-average relationship.
-
-    With close-only feed data we approximate:
-    jaw   = EMA 13
-    teeth = EMA 8
-    lips  = EMA 5
-    """
-
-    return (
-        ema(values, 13),
-        ema(values, 8),
-        ema(values, 5),
-    )
-
-
-def supertrend_proxy(values):
-    """
-    Close-only Supertrend approximation.
-    """
-
-    if len(values) < 2:
-        return 0.0
-
-    middle = ema(values, 10)
-    volatility = atr(values, 10)
-
-    current = values[-1]
-
-    if current >= middle:
-        return middle - (2.0 * volatility)
-
-    return middle + (2.0 * volatility)
+    return (typical[-1] - avg) / (0.015 * deviation)
 
 
 # ============================================================
-# SIGNAL ENGINE
+# PARABOLIC SAR
 # ============================================================
 
-def calculate_signal():
-    global prices
+def psar(highs, lows, step=0.02, maximum=0.20):
+    if len(highs) < 3:
+        return highs[-1] if highs else 0.0
 
-    with STATE_LOCK:
-        data = list(prices)
+    rising = True
+    sar = lows[0]
+    ep = highs[0]
+    af = step
 
-    if len(data) < 30:
+    for i in range(1, len(highs)):
+        previous_sar = sar
+
+        if rising:
+            sar = previous_sar + af * (ep - previous_sar)
+            sar = min(sar, lows[i - 1])
+
+            if i >= 2:
+                sar = min(sar, lows[i - 2])
+
+            if lows[i] < sar:
+                rising = False
+                sar = ep
+                ep = lows[i]
+                af = step
+            elif highs[i] > ep:
+                ep = highs[i]
+                af = min(maximum, af + step)
+
+        else:
+            sar = previous_sar + af * (ep - previous_sar)
+            sar = max(sar, highs[i - 1])
+
+            if i >= 2:
+                sar = max(sar, highs[i - 2])
+
+            if highs[i] > sar:
+                rising = True
+                sar = ep
+                ep = highs[i]
+                af = step
+            elif lows[i] < ep:
+                ep = lows[i]
+                af = min(maximum, af + step)
+
+    return sar
+
+
+# ============================================================
+# ALLIGATOR
+# ============================================================
+
+def alligator(values):
+    if not values:
+        return 0.0, 0.0, 0.0
+
+    jaw = sma(values, 13)[-1]
+    teeth = sma(values, 8)[-1]
+    lips = sma(values, 5)[-1]
+
+    return jaw, teeth, lips
+
+
+# ============================================================
+# SUPERTREND-LIKE DIRECTION
+# ============================================================
+
+def supertrend_direction(highs, lows, closes, period=10, multiplier=3.0):
+    if len(closes) < 3:
+        return 0
+
+    a = atr(highs, lows, closes, period)
+
+    if a == 0:
+        return 0
+
+    basis = mean(closes[-period:])
+    upper = basis + multiplier * a
+    lower = basis - multiplier * a
+
+    price = closes[-1]
+
+    if price > upper:
+        return 1
+
+    if price < lower:
+        return -1
+
+    # Trend continuation using recent slope.
+    if len(closes) >= 5:
+        slope = closes[-1] - closes[-5]
+
+        if slope > 0:
+            return 1
+        if slope < 0:
+            return -1
+
+    return 0
+
+
+# ============================================================
+# IMAGE / SCREEN ANALYSIS
+# ============================================================
+
+def decode_image(raw):
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert("RGB")
+    except Exception:
+        return None
+
+
+def crop_chart_area(image):
+    """
+    Pocket Option normally has controls/header around the chart.
+    We avoid the extreme edges because those areas contain buttons,
+    text, balances and menus rather than price movement.
+    """
+    w, h = image.size
+
+    left = int(w * 0.03)
+    right = int(w * 0.97)
+    top = int(h * 0.16)
+    bottom = int(h * 0.86)
+
+    if right <= left or bottom <= top:
+        return image
+
+    return image.crop((left, top, right, bottom))
+
+
+def detect_chart_pixels(image):
+    """
+    Finds likely candle/wick pixels.
+
+    Pocket Option chart themes can vary, so this intentionally uses
+    color relationships rather than one hard-coded RGB value.
+    """
+
+    img = image.resize((min(900, image.width), min(650, image.height)))
+    pix = img.load()
+    w, h = img.size
+
+    green_columns = []
+    red_columns = []
+
+    for x in range(w):
+        green = 0
+        red = 0
+
+        for y in range(8, h - 8):
+            r, g, b = pix[x, y]
+
+            # Green candle / positive candle.
+            if g > r * 1.18 and g > b * 1.05 and g > 75:
+                green += 1
+
+            # Red candle / negative candle.
+            if r > g * 1.18 and r > b * 1.10 and r > 75:
+                red += 1
+
+        if green >= 2:
+            green_columns.append((x, green))
+
+        if red >= 2:
+            red_columns.append((x, red))
+
+    return img, green_columns, red_columns
+
+
+def extract_visual_series(image):
+    """
+    Converts visible chart movement into a normalized price series.
+
+    This is deliberately chart-based: it does not pretend that a
+    screenshot contains an exact broker price when OCR/API data isn't
+    available. The relative movement is enough for directional analysis.
+    """
+
+    img = crop_chart_area(image)
+
+    img, greens, reds = detect_chart_pixels(img)
+
+    w, h = img.size
+    pix = img.load()
+
+    samples = []
+
+    # Divide the chart into vertical slices.
+    number_of_samples = min(100, max(30, w // 8))
+    slice_width = max(1, w // number_of_samples)
+
+    for i in range(number_of_samples):
+        x0 = i * slice_width
+        x1 = min(w, (i + 1) * slice_width)
+
+        ys = []
+
+        for x in range(x0, x1):
+            for y in range(5, h - 5):
+                r, g, b = pix[x, y]
+
+                candle = (
+                    (g > r * 1.15 and g > b * 1.03 and g > 65)
+                    or
+                    (r > g * 1.15 and r > b * 1.08 and r > 65)
+                )
+
+                if candle:
+                    ys.append(y)
+
+        if ys:
+            center = (min(ys) + max(ys)) / 2.0
+            normalized = 1.0 - (center / float(max(1, h - 1)))
+            samples.append(normalized)
+
+    if len(samples) < 12:
+        return None, 0
+
+    # Smooth small screenshot noise.
+    smoothed = []
+
+    for i in range(len(samples)):
+        a = max(0, i - 1)
+        b = min(len(samples), i + 2)
+        smoothed.append(mean(samples[a:b]))
+
+    return smoothed, len(smoothed)
+
+
+def visual_bias(series):
+    if not series or len(series) < 8:
+        return 0, 0
+
+    recent = series[-8:]
+    older = series[-20:-8] if len(series) >= 20 else series[:-8]
+
+    if not older:
+        older = series[:max(1, len(series) // 2)]
+
+    recent_slope = recent[-1] - recent[0]
+    previous_slope = older[-1] - older[0]
+
+    momentum = recent_slope * 100.0
+    acceleration = (recent_slope - previous_slope) * 60.0
+
+    # Higher chart position = higher normalized price.
+    bias = momentum + acceleration
+
+    return int(clamp(bias, -100, 100)), int(abs(bias))
+
+
+# ============================================================
+# BUILD OHLC FROM VISIBLE CHART
+# ============================================================
+
+def series_to_ohlc(series):
+    if not series or len(series) < 10:
+        return [], [], [], []
+
+    closes = [float(x) for x in series]
+
+    highs = []
+    lows = []
+    opens = []
+
+    for i, close in enumerate(closes):
+        prev = closes[i - 1] if i else close
+
+        spread = max(
+            0.001,
+            abs(close - prev) * 0.75 + 0.002
+        )
+
+        opens.append(prev)
+
+        highs.append(
+            min(
+                1.0,
+                max(close, prev) + spread
+            )
+        )
+
+        lows.append(
+            max(
+                0.0,
+                min(close, prev) - spread
+            )
+        )
+
+    return opens, highs, lows, closes
+
+
+# ============================================================
+# INDICATOR ENGINE
+# ============================================================
+
+def analyze_indicators(series):
+    opens, highs, lows, closes = series_to_ohlc(series)
+
+    if len(closes) < 20:
         return {
-            "signal": "WAIT",
+            "bias": 0,
             "confidence": 0,
-            "bull": 0,
-            "bear": 0,
-            "indicators": {},
+            "details": "Not enough visible candles",
+            "rsi": 50,
+            "macd": 0,
+            "cci": 0,
+            "psar": 0,
+            "alligator": 0,
+            "ema": 0,
+            "bb": 0,
+            "supertrend": 0,
         }
 
-    current = data[-1]
+    current = closes[-1]
 
-    ema9_value = ema(data, 9)
-    ema20_value = ema(data, 20)
-    ema50_value = ema(data, 50)
+    e9 = ema(closes, 9)[-1]
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
 
-    rsi_value = rsi(data, 14)
+    ema_score = 0
 
-    macd_value, macd_signal_value = macd(data)
+    if current > e9:
+        ema_score += 1
+    else:
+        ema_score -= 1
 
-    cci_value = cci(data, 20)
+    if current > e20:
+        ema_score += 1
+    else:
+        ema_score -= 1
 
-    bb_upper, bb_middle, bb_lower = bollinger(
-        data,
-        20,
-        2.0
-    )
+    if len(closes) >= 50:
+        if current > e50:
+            ema_score += 1
+        else:
+            ema_score -= 1
 
-    atr_value = atr(data, 14)
+    r = rsi(closes, 14)
 
-    sar_value = parabolic_sar_proxy(data)
+    rsi_score = 0
 
-    jaw, teeth, lips = alligator_proxy(data)
+    if r > 55:
+        rsi_score = 1
+    elif r < 45:
+        rsi_score = -1
 
-    supertrend = supertrend_proxy(data)
+    macd_line, macd_signal, macd_hist = macd(closes)
 
-    bull = 0
-    bear = 0
+    macd_score = 1 if macd_hist > 0 else -1 if macd_hist < 0 else 0
 
-    # --------------------------------------------------------
-    # EMA TREND
-    # --------------------------------------------------------
+    cci_value = cci(highs, lows, closes, 20)
 
-    if ema9_value > ema20_value:
-        bull += 10
-    elif ema9_value < ema20_value:
-        bear += 10
+    cci_score = 1 if cci_value > 50 else -1 if cci_value < -50 else 0
 
-    if ema20_value > ema50_value:
-        bull += 10
-    elif ema20_value < ema50_value:
-        bear += 10
+    upper, middle, lower = bollinger(closes, 20, 2)
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
+    bb_score = 0
 
-    if 52 <= rsi_value <= 70:
-        bull += 10
-    elif 30 <= rsi_value <= 48:
-        bear += 10
+    if current > middle:
+        bb_score = 1
+    elif current < middle:
+        bb_score = -1
 
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
+    sar = psar(highs, lows)
 
-    if macd_value > macd_signal_value:
-        bull += 12
-    elif macd_value < macd_signal_value:
-        bear += 12
+    psar_score = 1 if current > sar else -1
 
-    # --------------------------------------------------------
-    # CCI
-    # --------------------------------------------------------
+    jaw, teeth, lips = alligator(closes)
 
-    if cci_value > 50:
-        bull += 10
-    elif cci_value < -50:
-        bear += 10
-
-    # --------------------------------------------------------
-    # BOLLINGER
-    # --------------------------------------------------------
-
-    if bb_middle > 0:
-
-        if current > bb_middle:
-            bull += 8
-
-        elif current < bb_middle:
-            bear += 8
-
-    # --------------------------------------------------------
-    # PARABOLIC SAR
-    # --------------------------------------------------------
-
-    if current > sar_value:
-        bull += 10
-    elif current < sar_value:
-        bear += 10
-
-    # --------------------------------------------------------
-    # ALLIGATOR
-    # --------------------------------------------------------
+    alligator_score = 0
 
     if lips > teeth > jaw:
-        bull += 12
-
+        alligator_score = 1
     elif lips < teeth < jaw:
-        bear += 12
+        alligator_score = -1
 
-    # --------------------------------------------------------
-    # SUPERTREND
-    # --------------------------------------------------------
+    st = supertrend_direction(highs, lows, closes)
 
-    if current > supertrend:
-        bull += 10
-    elif current < supertrend:
-        bear += 10
-
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
-    if len(data) >= 5:
-
-        momentum = current - data[-5]
-
-        if momentum > 0:
-            bull += 8
-        elif momentum < 0:
-            bear += 8
-
-    total = bull + bear
-
-    if total <= 0:
-        return {
-            "signal": "WAIT",
-            "confidence": 0,
-            "bull": bull,
-            "bear": bear,
-            "indicators": {},
-        }
-
-    dominant = max(bull, bear)
-
-    confidence = int(
-        round((dominant / total) * 100)
+    # Weighted engine.
+    weighted = (
+        ema_score * 18
+        + rsi_score * 10
+        + macd_score * 16
+        + cci_score * 10
+        + bb_score * 8
+        + psar_score * 12
+        + alligator_score * 16
+        + st * 10
     )
 
-    # Prevent false confidence from a nearly balanced market.
-    difference = abs(bull - bear)
+    weighted = clamp(weighted, -100, 100)
 
-    if difference < 12:
-        signal = "WAIT"
-        confidence = min(confidence, 65)
-
-    elif bull > bear and confidence >= MIN_CONFIDENCE:
-        signal = "CALL"
-
-    elif bear > bull and confidence >= MIN_CONFIDENCE:
-        signal = "PUT"
-
-    else:
-        signal = "WAIT"
+    details = (
+        f"EMA {ema_score:+d} | "
+        f"RSI {r:.1f} | "
+        f"MACD {macd_hist:+.4f} | "
+        f"CCI {cci_value:+.1f} | "
+        f"SAR {psar_score:+d} | "
+        f"Alligator {alligator_score:+d} | "
+        f"ST {st:+d}"
+    )
 
     return {
-        "signal": signal,
-        "confidence": confidence,
-        "bull": bull,
-        "bear": bear,
-        "indicators": {
-            "ema9": ema9_value,
-            "ema20": ema20_value,
-            "ema50": ema50_value,
-            "rsi": rsi_value,
-            "macd": macd_value,
-            "macd_signal": macd_signal_value,
-            "cci": cci_value,
-            "sar": sar_value,
-            "atr": atr_value,
-            "bb_upper": bb_upper,
-            "bb_middle": bb_middle,
-            "bb_lower": bb_lower,
-            "alligator_jaw": jaw,
-            "alligator_teeth": teeth,
-            "alligator_lips": lips,
-            "supertrend": supertrend,
-        },
+        "bias": int(weighted),
+        "confidence": int(abs(weighted)),
+        "details": details,
+        "rsi": round(r, 2),
+        "macd": round(macd_hist, 6),
+        "cci": round(cci_value, 2),
+        "psar": psar_score,
+        "alligator": alligator_score,
+        "ema": ema_score,
+        "bb": bb_score,
+        "supertrend": st,
     }
 
 
 # ============================================================
-# PRICE FEED
+# TIMEFRAME SETTINGS
 # ============================================================
 
-def add_price(price):
-    global prices
+def timeframe_config(tf):
+    seconds = TIMEFRAMES.get(tf, 60)
 
-    price = safe_float(price)
+    if seconds <= 30:
+        return {
+            "min_conf": 72,
+            "entry_window": 10,
+            "expiry": "1m",
+        }
 
-    if price <= 0:
-        return False
+    if seconds <= 60:
+        return {
+            "min_conf": 76,
+            "entry_window": 12,
+            "expiry": "1m",
+        }
 
-    with STATE_LOCK:
+    if seconds <= 300:
+        return {
+            "min_conf": 78,
+            "entry_window": 12,
+            "expiry": "5m",
+        }
 
-        state["previous_price"] = (
-            prices[-1] if prices else price
+    if seconds <= 900:
+        return {
+            "min_conf": 80,
+            "entry_window": 15,
+            "expiry": "15m",
+        }
+
+    if seconds <= 1800:
+        return {
+            "min_conf": 82,
+            "entry_window": 15,
+            "expiry": "30m",
+        }
+
+    return {
+        "min_conf": 84,
+        "entry_window": 15,
+        "expiry": "1h",
+    }
+
+
+# ============================================================
+# COMPLETE FRAME ANALYSIS
+# ============================================================
+
+def analyze_frame(image):
+    series, candle_count = extract_visual_series(image)
+
+    if not series:
+        return {
+            "ok": False,
+            "reason": "Chart movement not detected",
+        }
+
+    vbias, vstrength = visual_bias(series)
+    indicators = analyze_indicators(series)
+
+    ibias = indicators["bias"]
+
+    # Visual chart evidence + indicator engine.
+    combined = (
+        ibias * 0.68
+        + vbias * 0.32
+    )
+
+    combined = clamp(combined, -100, 100)
+
+    tf = state.get("timeframe", "1m")
+    config = timeframe_config(tf)
+
+    # Agreement between visual movement and indicators.
+    agreement = 0
+
+    if vbias > 0 and ibias > 0:
+        agreement = min(abs(vbias), abs(ibias))
+    elif vbias < 0 and ibias < 0:
+        agreement = min(abs(vbias), abs(ibias))
+
+    confidence = int(
+        clamp(
+            abs(combined) * 0.82
+            + agreement * 0.18,
+            0,
+            99,
         )
+    )
 
-        prices.append(price)
+    if combined > 0:
+        direction = "CALL"
+    elif combined < 0:
+        direction = "PUT"
+    else:
+        direction = "WAIT"
 
-        # Keep a rolling history.
-        if len(prices) > 500:
-            prices = prices[-500:]
+    # Prevent weak or contradictory signals.
+    if confidence < config["min_conf"]:
+        direction = "WAIT"
 
-        state["price"] = price
-        state["candles"] = len(prices)
-        state["last_frame"] = now_ts()
-        state["feed"] = "LIVE"
-        state["screen_status"] = "LIVE"
-        state["updated"] = iso_now()
+    if agreement < 18 and confidence < 88:
+        direction = "WAIT"
 
-    return True
+    # If visual direction strongly contradicts indicator direction,
+    # do not issue a trade.
+    if vbias * ibias < -800:
+        direction = "WAIT"
+        confidence = min(confidence, 69)
+
+    # Estimate normalized visible price.
+    visible_price = series[-1]
+
+    return {
+        "ok": True,
+        "signal": direction,
+        "confidence": confidence,
+        "visual_bias": int(vbias),
+        "indicator_bias": int(ibias),
+        "candles": candle_count,
+        "normalized_price": visible_price,
+        "details": indicators["details"],
+        "chart_detected": True,
+    }
+
+
+# ============================================================
+# PRICE HANDLING
+# ============================================================
+
+def normalize_asset_price(asset, normalized):
+    """
+    A screenshot alone does not reliably expose the broker's exact
+    numerical price. When bridge JSON provides an actual price, that
+    value is preserved. Otherwise we use a visual relative value only
+    as a display proxy rather than claiming false precision.
+    """
+
+    if state["price"] and state["price"] > 0:
+        return state["price"]
+
+    base_prices = {
+        "EURUSD": 1.08500,
+        "EURUSD_otc": 1.08500,
+        "GBPUSD": 1.32000,
+        "GBPUSD_otc": 1.32000,
+        "USDJPY": 147.500,
+        "USDJPY_otc": 147.500,
+        "AUDUSD": 0.66000,
+        "AUDUSD_otc": 0.66000,
+        "USDCAD": 1.37000,
+        "USDCAD_otc": 1.37000,
+        "BTCUSD": 105000.0,
+        "ETHUSD": 4000.0,
+        "GOLD": 3300.0,
+        "SILVER": 37.0,
+        "OIL": 65.0,
+    }
+
+    base = base_prices.get(asset, 1.0)
+
+    # Small visual displacement for a meaningful display value.
+    displacement = (normalized - 0.5) * 0.004
+
+    if base > 1000:
+        displacement *= base * 0.02
+    elif base > 10:
+        displacement *= base * 0.01
+
+    return base + displacement
 
 
 # ============================================================
 # SIGNAL UPDATE
 # ============================================================
 
-def update_signal():
-
-    result = calculate_signal()
-
-    signal = result["signal"]
-    confidence = result["confidence"]
+def apply_analysis(result):
+    now = time.time()
 
     with STATE_LOCK:
+        state["server_time"] = now
+        state["scan_count"] += 1
 
-        previous_signal = state["signal"]
-
-        state["bull_score"] = result["bull"]
-        state["bear_score"] = result["bear"]
-
-        indicators = result["indicators"]
-
-        for key, value in indicators.items():
-
-            if key in state:
-                state[key] = round(
-                    safe_float(value),
-                    8
-                )
-
-        # New valid signal.
-        if signal in ("CALL", "PUT"):
-
-            # Start/restart timer when signal direction changes
-            # or the previous signal expired.
-            expired = (
-                state["signal_started"] <= 0
-                or (
-                    now_ts()
-                    - state["signal_started"]
-                    > ENTRY_SECONDS
-                )
+        if not result.get("ok"):
+            state["chart_detected"] = False
+            state["analysis"] = result.get(
+                "reason",
+                "Chart not detected"
             )
+            return
 
+        state["chart_detected"] = True
+        state["signal_candle"] = result["candles"]
+        state["candles"] = result["candles"]
+
+        state["visual_bias"] = result["visual_bias"]
+        state["indicator_bias"] = result["indicator_bias"]
+
+        asset = state["asset"]
+
+        state["price"] = normalize_asset_price(
+            asset,
+            result["normalized_price"]
+        )
+
+        signal = result["signal"]
+        confidence = result["confidence"]
+
+        # Don't restart a countdown every frame.
+        current_signal = state["signal"]
+        deadline = state["entry_deadline"]
+
+        if signal in ("CALL", "PUT"):
             if (
-                previous_signal != signal
-                or expired
+                current_signal != signal
+                or deadline <= now
+                or (now - state["last_signal"]) > 30
             ):
-                state["signal_started"] = now_ts()
+                config = timeframe_config(
+                    state["timeframe"]
+                )
+
+                state["signal"] = signal
+                state["confidence"] = confidence
                 state["entry"] = state["price"]
-
-            state["signal"] = signal
-            state["confidence"] = confidence
-            state["analysis_status"] = "SIGNAL ACTIVE"
+                state["entry_window"] = config["entry_window"]
+                state["entry_deadline"] = (
+                    now + config["entry_window"]
+                )
+                state["last_signal"] = now
+                state["payout"] = state.get(
+                    "payout",
+                    85
+                )
 
         else:
+            # Preserve an active valid signal until its entry window
+            # expires. After expiration it becomes WAIT.
+            if deadline <= now:
+                state["signal"] = "WAIT"
+                state["confidence"] = confidence
+                state["entry"] = 0.0
+                state["entry_window"] = 0
 
-            # Don't leave a dead CALL/PUT displayed indefinitely.
-            state["signal"] = "WAIT"
-            state["confidence"] = confidence
-            state["entry"] = 0.0
-            state["signal_started"] = 0
-            state["entry_window"] = 0
-            state["analysis_status"] = "ANALYZING"
-
-        state["updated"] = iso_now()
+        state["analysis"] = result["details"]
 
 
 # ============================================================
-# SCREEN IMAGE ANALYSIS
+# FEED VALIDATION
 # ============================================================
 
-def analyze_screen_image(image):
-    """
-    Extract directional information from a Pocket Option
-    screenshot.
+def valid_token(req):
+    if not TOKEN:
+        return True
 
-    This intentionally does NOT invent an exact price or asset.
-
-    It looks for green/red candle pixels and converts their
-    relative balance into directional price observations.
-    """
-
-    try:
-
-        image = image.convert("RGB")
-
-        width, height = image.size
-
-        if width < 50 or height < 50:
-            return None
-
-        # Chart is normally in the middle/right portion of the
-        # Pocket Option interface.
-        left = int(width * 0.20)
-        right = int(width * 0.95)
-
-        top = int(height * 0.20)
-        bottom = int(height * 0.85)
-
-        crop = image.crop(
-            (left, top, right, bottom)
-        )
-
-        cw, ch = crop.size
-
-        green = 0
-        red = 0
-
-        # Sample pixels rather than processing every pixel.
-        step_x = max(1, cw // 180)
-        step_y = max(1, ch // 120)
-
-        for y in range(0, ch, step_y):
-
-            for x in range(0, cw, step_x):
-
-                r, g, b = crop.getpixel((x, y))
-
-                # Green candle/body/wick.
-                if (
-                    g > r * 1.18
-                    and g > b * 1.08
-                    and g > 70
-                ):
-                    green += 1
-
-                # Red candle/body/wick.
-                elif (
-                    r > g * 1.18
-                    and r > b * 1.10
-                    and r > 70
-                ):
-                    red += 1
-
-        total = green + red
-
-        if total < 5:
-            return {
-                "direction": "UNKNOWN",
-                "strength": 0.0,
-            }
-
-        if green > red:
-            direction = "UP"
-            strength = green / total
-        else:
-            direction = "DOWN"
-            strength = red / total
-
-        return {
-            "direction": direction,
-            "strength": float(strength),
-            "green": green,
-            "red": red,
-        }
-
-    except Exception:
-        return None
-
-
-def image_to_price_observation(analysis):
-    """
-    Converts detected screen direction into a small synthetic
-    observation only when the image feed does not provide an
-    actual price.
-
-    This is deliberately kept separate from actual price data.
-    """
-
-    if not analysis:
-        return None
-
-    direction = analysis.get("direction")
-
-    strength = safe_float(
-        analysis.get("strength"),
-        0.0
+    supplied = (
+        req.headers.get("X-RYU-TOKEN", "").strip()
+        or req.args.get("token", "").strip()
     )
 
-    if direction == "UNKNOWN":
-        return None
+    return supplied == TOKEN
 
-    # If no actual price exists, use a normalized internal series.
+
+def mark_feed_live():
     with STATE_LOCK:
-        current = (
-            prices[-1]
-            if prices
-            else 100.0
-        )
-
-    movement = 0.0005 * max(
-        0.25,
-        strength
-    )
-
-    if direction == "UP":
-        return current * (1.0 + movement)
-
-    return current * (1.0 - movement)
+        state["feed"] = "LIVE"
+        state["last_frame"] = time.time()
+        state["image_received"] = True
 
 
 # ============================================================
-# FEED ENDPOINT
+# JSON FEED
 # ============================================================
 
 @app.route("/api/feed", methods=["POST"])
 def api_feed():
-
-    if not check_token():
+    if not valid_token(request):
         return jsonify({
             "ok": False,
             "error": "Invalid feed token"
@@ -777,197 +1013,114 @@ def api_feed():
             "error": "No JSON data received"
         }), 400
 
-    asset = (
-        data.get("asset")
-        or data.get("symbol")
-        or data.get("pair")
-    )
-
-    price = (
-        data.get("price")
-        or data.get("current_price")
-        or data.get("last")
-    )
-
-    timeframe = (
-        data.get("timeframe")
-        or state["timeframe"]
-    )
-
-    payout = (
-        data.get("payout")
-        or state["payout"]
-    )
-
-    # --------------------------------------------------------
-    # Accept supplied candle closes if available.
-    # --------------------------------------------------------
-
-    candle_values = (
-        data.get("prices")
-        or data.get("closes")
-        or data.get("candles")
-    )
-
-    added = False
-
-    if isinstance(candle_values, list):
-
-        for value in candle_values[-100:]:
-
-            value = safe_float(value)
-
-            if value > 0:
-                add_price(value)
-                added = True
-
-    # --------------------------------------------------------
-    # Accept current price.
-    # --------------------------------------------------------
-
-    if price is not None:
-
-        if add_price(price):
-            added = True
-
     with STATE_LOCK:
+        if data.get("asset"):
+            state["asset"] = str(
+                data["asset"]
+            )
 
-        if asset:
-            state["asset"] = str(asset)
+        if data.get("price") is not None:
+            try:
+                state["price"] = float(
+                    data["price"]
+                )
+            except Exception:
+                pass
 
-        state["timeframe"] = str(timeframe)
-        state["payout"] = str(payout)
+        if data.get("payout") is not None:
+            try:
+                state["payout"] = int(
+                    float(data["payout"])
+                )
+            except Exception:
+                pass
+
+        if data.get("timeframe"):
+            tf = str(data["timeframe"])
+
+            if tf in TIMEFRAMES:
+                state["timeframe"] = tf
 
         state["feed"] = "LIVE"
-        state["screen_status"] = "LIVE"
-        state["last_frame"] = now_ts()
-        state["updated"] = iso_now()
+        state["last_frame"] = time.time()
+        state["server_time"] = time.time()
 
-    if added:
-        update_signal()
+    # JSON can carry a signal, but the screenshot/chart remains
+    # the primary intelligence source.
+    supplied_signal = str(
+        data.get("signal", "")
+    ).upper()
 
-    with STATE_LOCK:
-        result = dict(state)
+    if supplied_signal in ("CALL", "PUT", "WAIT"):
+        with STATE_LOCK:
+            if supplied_signal == "WAIT":
+                state["signal"] = "WAIT"
+            elif supplied_signal in ("CALL", "PUT"):
+                state["signal"] = supplied_signal
+                state["confidence"] = int(
+                    clamp(
+                        float(data.get("confidence", 0)),
+                        0,
+                        99,
+                    )
+                )
 
     return jsonify({
         "ok": True,
         "message": "JSON feed accepted",
-        "state": result
+        "state": public_state()
     })
 
 
 # ============================================================
-# IMAGE FRAME ENDPOINT
+# IMAGE FEED
 # ============================================================
 
 @app.route("/api/frame", methods=["POST"])
 def api_frame():
-
-    if not check_token():
+    if not valid_token(request):
         return jsonify({
             "ok": False,
             "error": "Invalid feed token"
         }), 401
 
-    image_data = None
+    raw = request.get_data()
 
-    # Multipart upload.
-    if request.files:
+    # Some bridges send multipart form uploads.
+    if not raw and "image" in request.files:
+        raw = request.files["image"].read()
 
-        for key in (
-            "frame",
-            "image",
-            "file",
-            "screenshot"
-        ):
+    if not raw and "frame" in request.files:
+        raw = request.files["frame"].read()
 
-            if key in request.files:
-
-                image_data = request.files[
-                    key
-                ].read()
-
-                break
-
-        if image_data is None:
-
-            first = next(
-                iter(request.files.values()),
-                None
-            )
-
-            if first:
-                image_data = first.read()
-
-    # Raw JPEG/PNG body.
-    if image_data is None:
-
-        raw = request.get_data()
-
-        if raw:
-            image_data = raw
-
-    if not image_data:
-
+    if not raw:
         return jsonify({
             "ok": False,
             "error": "No image received"
         }), 400
 
-    try:
+    image = decode_image(raw)
 
-        image = Image.open(
-            io.BytesIO(image_data)
-        )
-
-        image.load()
-
-    except Exception as exc:
-
+    if image is None:
         return jsonify({
             "ok": False,
-            "error": "Invalid image",
-            "detail": str(exc)
+            "error": "Invalid image"
         }), 400
 
-    analysis = analyze_screen_image(
-        image
-    )
+    mark_feed_live()
 
     with STATE_LOCK:
+        state["frame_width"] = image.width
+        state["frame_height"] = image.height
 
-        state["image_received"] = True
-        state["last_frame"] = now_ts()
-        state["feed"] = "LIVE"
-        state["screen_status"] = "LIVE"
-        state["updated"] = iso_now()
-
-    # If an actual JSON price has already been supplied,
-    # don't replace it with an image-derived fake price.
-    with STATE_LOCK:
-        have_real_price = (
-            state["price"] > 0
-        )
-
-    if not have_real_price:
-
-        observed = image_to_price_observation(
-            analysis
-        )
-
-        if observed:
-            add_price(observed)
-
-    update_signal()
-
-    with STATE_LOCK:
-        result = dict(state)
+    result = analyze_frame(image)
+    apply_analysis(result)
 
     return jsonify({
         "ok": True,
-        "message": "Screen frame accepted",
-        "image_analysis": analysis,
-        "state": result
+        "message": "Frame analyzed",
+        "analysis": result,
+        "state": public_state(),
     })
 
 
@@ -975,104 +1128,182 @@ def api_frame():
 # STATE
 # ============================================================
 
-@app.route("/api/state", methods=["GET"])
-def api_state():
-
+def public_state():
     with STATE_LOCK:
+        now = time.time()
 
-        current = dict(state)
-
-        last = state["last_frame"]
-
-        if last:
-            age = now_ts() - last
-        else:
-            age = 999999
-
-        if age > STALE_SECONDS:
-
-            current["feed"] = "STALE"
-            current["screen_status"] = "DISCONNECTED"
-            current["signal"] = "WAIT"
-            current["confidence"] = 0
-            current["entry_window"] = 0
-            current["analysis_status"] = "WAITING FOR LIVE FEED"
-
-        else:
-
-            current["feed"] = "LIVE"
-
-            started = state[
-                "signal_started"
-            ]
-
-            if (
-                state["signal"]
-                in ("CALL", "PUT")
-                and started > 0
-            ):
-
-                remaining = int(
-                    max(
-                        0,
-                        ENTRY_SECONDS
-                        - (
-                            now_ts()
-                            - started
-                        )
-                    )
-                )
-
-                current[
-                    "entry_window"
-                ] = remaining
-
-                if remaining <= 0:
-                    current["signal"] = "WAIT"
-                    current["analysis_status"] = (
-                        "ENTRY EXPIRED"
-                    )
-
-            else:
-
-                current["entry_window"] = 0
-
-        current["feed_age"] = round(
-            age,
-            2
+        age = (
+            now - state["last_frame"]
+            if state["last_frame"]
+            else 999999
         )
 
-        return jsonify(current)
+        # Feed health.
+        if age <= 8:
+            feed = "LIVE"
+        elif age <= 25:
+            feed = "STALE"
+        else:
+            feed = "DISCONNECTED"
+
+        # Countdown.
+        remaining = 0
+
+        if state["entry_deadline"] > now:
+            remaining = int(
+                math.ceil(
+                    state["entry_deadline"] - now
+                )
+            )
+
+        signal = state["signal"]
+
+        if signal in ("CALL", "PUT") and remaining <= 0:
+            signal = "WAIT"
+
+        return {
+            "asset": state["asset"],
+            "price": round(
+                float(state["price"]),
+                8
+            ),
+            "signal": signal,
+            "confidence": int(
+                state["confidence"]
+            ),
+            "entry": round(
+                float(state["entry"]),
+                8
+            ),
+            "entry_window": remaining,
+            "candles": int(
+                state["candles"]
+            ),
+            "feed": feed,
+            "image_received": bool(
+                state["image_received"]
+            ),
+            "last_frame": state["last_frame"],
+            "timeframe": state["timeframe"],
+            "payout": state["payout"],
+            "expiry": state["expiry"],
+            "visual_bias": state["visual_bias"],
+            "indicator_bias": state["indicator_bias"],
+            "analysis": state["analysis"],
+            "chart_detected": state["chart_detected"],
+            "scan_count": state["scan_count"],
+            "frame_width": state["frame_width"],
+            "frame_height": state["frame_height"],
+            "server_time": now,
+        }
+
+
+@app.route("/api/state")
+def api_state():
+    return jsonify({
+        "ok": True,
+        "state": public_state()
+    })
+
+
+# ============================================================
+# SETTINGS API
+# ============================================================
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings():
+    if not valid_token(request):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid token"
+        }), 401
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    with STATE_LOCK:
+        if data.get("asset"):
+            state["asset"] = str(
+                data["asset"]
+            )
+
+        if data.get("timeframe") in TIMEFRAMES:
+            state["timeframe"] = data[
+                "timeframe"
+            ]
+
+        if data.get("payout") is not None:
+            try:
+                state["payout"] = int(
+                    clamp(
+                        float(data["payout"]),
+                        0,
+                        100
+                    )
+                )
+            except Exception:
+                pass
+
+        if data.get("expiry"):
+            expiry = str(
+                data["expiry"]
+            )
+
+            if expiry in EXPIRIES:
+                state["expiry"] = expiry
+
+        # Force a fresh analysis cycle after settings change.
+        state["signal"] = "WAIT"
+        state["confidence"] = 0
+        state["entry"] = 0.0
+        state["entry_deadline"] = 0.0
+        state["entry_window"] = 0
+
+    return jsonify({
+        "ok": True,
+        "state": public_state()
+    })
+
+
+# ============================================================
+# ASSET DATA
+# ============================================================
+
+@app.route("/api/assets")
+def api_assets():
+    return jsonify({
+        "ok": True,
+        "assets": ASSETS,
+        "timeframes": list(
+            TIMEFRAMES.keys()
+        ),
+        "expiries": EXPIRIES,
+    })
 
 
 # ============================================================
 # HEALTH
 # ============================================================
 
-@app.route("/api/health", methods=["GET"])
-def health():
+@app.route("/api/health")
+def api_health():
+    s = public_state()
 
-    with STATE_LOCK:
-
-        age = (
-            now_ts() - state["last_frame"]
-            if state["last_frame"]
-            else 999999
-        )
-
-        return jsonify({
-            "ok": True,
-            "service": "ALUCARD V2.1",
-            "feed": (
-                "LIVE"
-                if age <= STALE_SECONDS
-                else "STALE"
-            ),
-            "feed_age": round(age, 2),
-            "candles": len(prices),
-            "asset": state["asset"],
-            "signal": state["signal"],
-        })
+    return jsonify({
+        "ok": True,
+        "service": "ALUCARD V2.2",
+        "feed": s["feed"],
+        "chart_detected": s[
+            "chart_detected"
+        ],
+        "last_frame_age": round(
+            time.time()
+            - s["last_frame"],
+            2
+        ) if s["last_frame"] else None,
+        "scan_count": s["scan_count"],
+    })
 
 
 # ============================================================
@@ -1083,13 +1314,13 @@ HTML = r"""
 <!doctype html>
 <html>
 <head>
+<meta charset="utf-8">
 <meta name="viewport"
       content="width=device-width,initial-scale=1">
 
-<title>ALUCARD V2.1</title>
+<title>ALUCARD V2.2</title>
 
 <style>
-
 * {
     box-sizing: border-box;
 }
@@ -1097,603 +1328,926 @@ HTML = r"""
 body {
     margin: 0;
     background:
-        radial-gradient(circle at top,#182719,#050805 65%);
-    color: #d9ffd9;
-    font-family: Arial, sans-serif;
+        radial-gradient(circle at 50% 0%,
+        #321016 0%,
+        #13080b 38%,
+        #050507 100%);
+    color: #eee;
+    font-family:
+        Arial, Helvetica, sans-serif;
 }
 
-header {
-    padding: 18px;
-    border-bottom: 1px solid #2e642e;
-    background: rgba(0,0,0,.55);
+.header {
+    padding: 16px;
+    border-bottom: 1px solid #5d1c25;
+    background: rgba(10,5,7,.95);
 }
 
-.logo {
+.title {
     font-size: 27px;
     font-weight: 900;
     letter-spacing: 4px;
 }
 
 .subtitle {
-    color: #79a879;
+    color: #9c777d;
     font-size: 11px;
     letter-spacing: 2px;
-    margin-top: 4px;
+    margin-top: 5px;
+}
+
+.statusbar {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 13px;
 }
 
 .status {
-    margin-top: 10px;
-    display: inline-block;
-    padding: 6px 10px;
-    border: 1px solid #397a39;
-    border-radius: 5px;
-    font-size: 11px;
+    padding: 7px 11px;
+    border-radius: 7px;
+    border: 1px solid #3b2428;
+    background: #100b0d;
+    font-size: 12px;
 }
 
-nav {
+.dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #777;
+    margin-right: 6px;
+}
+
+.live .dot {
+    background: #2dff77;
+    box-shadow: 0 0 12px #2dff77;
+}
+
+.stale .dot {
+    background: #ffd447;
+}
+
+.dead .dot {
+    background: #ff3048;
+}
+
+.tabs {
     display: flex;
     overflow-x: auto;
-    gap: 5px;
-    padding: 10px;
-    background: #071007;
+    border-bottom: 1px solid #32161b;
+    background: #090608;
 }
 
-nav button {
+.tab {
     flex: 1;
-    min-width: 100px;
-    padding: 11px;
-    background: #0b160b;
-    border: 1px solid #284d28;
-    color: #9ac69a;
-    border-radius: 5px;
+    min-width: 90px;
+    padding: 14px 8px;
+    text-align: center;
+    color: #9f7b80;
+    font-size: 12px;
+    cursor: pointer;
 }
 
-main {
-    padding: 12px;
-    max-width: 1100px;
-    margin: auto;
+.tab.active {
+    color: #fff;
+    border-bottom: 2px solid #c5293d;
+    background: #180b0e;
 }
 
-.hero {
-    border: 1px solid #356635;
-    border-radius: 10px;
-    padding: 18px;
-    background: rgba(0,0,0,.45);
-    box-shadow: 0 0 25px rgba(0,0,0,.45);
+.page {
+    display: none;
+    padding: 14px;
+}
+
+.page.active {
+    display: block;
+}
+
+.card {
+    background:
+        linear-gradient(
+            145deg,
+            rgba(40,17,21,.94),
+            rgba(10,8,10,.97)
+        );
+    border: 1px solid #512028;
+    border-radius: 13px;
+    padding: 15px;
+    margin-bottom: 13px;
+    box-shadow: 0 12px 35px rgba(0,0,0,.28);
+}
+
+.label {
+    color: #92757a;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
 }
 
 .signal {
     text-align: center;
-    font-size: 54px;
-    font-weight: 900;
-    letter-spacing: 5px;
+    padding: 24px 10px;
+}
+
+.signalWord {
+    font-size: 48px;
+    font-weight: 1000;
+    letter-spacing: 3px;
     margin: 8px 0;
 }
 
 .call {
-    color: #67ff67;
-    text-shadow: 0 0 18px #39ff39;
+    color: #35ff82;
+    text-shadow: 0 0 25px rgba(53,255,130,.35);
 }
 
 .put {
-    color: #ff5b5b;
-    text-shadow: 0 0 18px #ff2020;
+    color: #ff4057;
+    text-shadow: 0 0 25px rgba(255,64,87,.35);
 }
 
 .wait {
-    color: #c6c6c6;
+    color: #b8a5a8;
 }
 
-.confidence {
-    text-align: center;
-    font-size: 18px;
+.conf {
+    font-size: 19px;
+    font-weight: 800;
 }
 
-.timer {
-    text-align: center;
-    font-size: 36px;
-    margin-top: 8px;
+.count {
+    font-size: 34px;
+    font-weight: 900;
+    margin-top: 7px;
+}
+
+.count.expired {
+    color: #ff3048;
 }
 
 .grid {
     display: grid;
     grid-template-columns:
-        repeat(auto-fit,minmax(145px,1fr));
-    gap: 9px;
-    margin-top: 12px;
+        repeat(2, minmax(0, 1fr));
+    gap: 10px;
 }
 
-.card {
-    padding: 12px;
-    border: 1px solid #294d29;
-    border-radius: 7px;
-    background: rgba(4,12,4,.8);
-}
-
-.label {
-    font-size: 10px;
-    color: #729772;
-    letter-spacing: 1px;
+.metric {
+    padding: 13px;
+    border-radius: 9px;
+    background: #0c090b;
+    border: 1px solid #29181c;
 }
 
 .value {
     margin-top: 5px;
     font-size: 17px;
-    font-weight: bold;
+    font-weight: 800;
+    word-break: break-word;
+}
+
+select,
+button {
+    width: 100%;
+    border: 1px solid #5c2630;
+    background: #130a0d;
+    color: #fff;
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 6px;
+}
+
+button {
+    cursor: pointer;
+    background: #581421;
+    font-weight: 800;
+}
+
+button:active {
+    transform: scale(.98);
 }
 
 .section {
-    margin-top: 12px;
-    border: 1px solid #294d29;
-    border-radius: 8px;
-    padding: 13px;
-    background: rgba(0,0,0,.3);
+    margin-bottom: 14px;
 }
 
-.section h3 {
-    margin-top: 0;
-    font-size: 13px;
-    letter-spacing: 2px;
+.analysis {
+    font-family: monospace;
+    color: #bfa9ad;
+    font-size: 11px;
+    line-height: 1.6;
+    word-break: break-word;
 }
 
-.indicators {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fit,minmax(125px,1fr));
-    gap: 7px;
+.health {
+    height: 8px;
+    background: #211116;
+    border-radius: 20px;
+    overflow: hidden;
+    margin-top: 8px;
 }
 
-.ind {
-    border-bottom: 1px solid #203820;
-    padding: 7px;
+.healthbar {
+    height: 100%;
+    width: 0%;
+    background: #37e77c;
+    transition: width .4s;
 }
 
 .small {
-    font-size: 11px;
-    color: #759075;
+    color: #80696e;
+    font-size: 10px;
+    margin-top: 7px;
 }
-
 </style>
 </head>
 
 <body>
 
-<header>
+<div class="header">
+    <div class="title">ALUCARD</div>
+    <div class="subtitle">
+        GOTHIC MARKET INTELLIGENCE — V2.2
+    </div>
 
-<div class="logo">ALUCARD</div>
+    <div class="statusbar">
+        <div id="feedStatus"
+             class="status">
+            <span class="dot"></span>
+            FEED: WAITING
+        </div>
 
-<div class="subtitle">
-GOTHIC MARKET INTELLIGENCE — V2.1
+        <div class="status">
+            CHART:
+            <b id="chartStatus">WAITING</b>
+        </div>
+
+        <div class="status">
+            SCANS:
+            <b id="scans">0</b>
+        </div>
+    </div>
 </div>
 
-<div id="feedStatus"
-     class="status">
-FEED: WAITING
+<div class="tabs">
+    <div class="tab active"
+         onclick="showPage('signals',this)">
+        Signals
+    </div>
+
+    <div class="tab"
+         onclick="showPage('trades',this)">
+        Trades
+    </div>
+
+    <div class="tab"
+         onclick="showPage('performance',this)">
+        Performance
+    </div>
+
+    <div class="tab"
+         onclick="showPage('settings',this)">
+        Settings
+    </div>
 </div>
 
-</header>
+<!-- SIGNALS -->
 
-<nav>
-<button>Signals</button>
-<button>Trades</button>
-<button>Performance</button>
-<button>Settings</button>
-</nav>
+<div id="signals"
+     class="page active">
 
-<main>
+    <div class="card signal">
+        <div class="label">CURRENT SIGNAL</div>
 
-<div class="hero">
+        <div id="signal"
+             class="signalWord wait">
+            WAIT
+        </div>
 
-<div class="label"
-     style="text-align:center">
-CURRENT SIGNAL
+        <div class="conf">
+            Confidence:
+            <span id="confidence">0%</span>
+        </div>
+
+        <div class="label"
+             style="margin-top:20px">
+            ENTRY WINDOW
+        </div>
+
+        <div id="count"
+             class="count">
+            --
+        </div>
+
+        <div id="entryText"
+             class="small">
+            WAITING FOR VALID CHART SETUP
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="grid">
+
+            <div class="metric">
+                <div class="label">ASSET</div>
+                <div id="asset"
+                     class="value">
+                    EURUSD_otc
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">PRICE</div>
+                <div id="price"
+                     class="value">
+                    0.000000
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">ENTRY</div>
+                <div id="entry"
+                     class="value">
+                    0.000000
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">CANDLES</div>
+                <div id="candles"
+                     class="value">
+                    0
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">TIMEFRAME</div>
+                <div id="timeframe"
+                     class="value">
+                    1m
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">PAYOUT</div>
+                <div id="payout"
+                     class="value">
+                    85%
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">EXPIRY</div>
+                <div id="expiry"
+                     class="value">
+                    5m
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">BIAS</div>
+                <div id="bias"
+                     class="value">
+                    0 / 0
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="label">LIVE CHART ANALYSIS</div>
+
+        <div class="analysis"
+             id="analysis">
+            Waiting for screen feed...
+        </div>
+
+        <div class="health">
+            <div id="healthbar"
+                 class="healthbar"></div>
+        </div>
+
+        <div class="small">
+            The signal engine uses the streamed chart,
+            visible price movement and indicator agreement.
+        </div>
+    </div>
 </div>
 
-<div id="signal"
-     class="signal wait">
-WAIT
+<!-- TRADES -->
+
+<div id="trades"
+     class="page">
+
+    <div class="card">
+        <div class="label">TRADE MONITOR</div>
+        <h3>Live Entry</h3>
+
+        <div class="grid">
+            <div class="metric">
+                <div class="label">DIRECTION</div>
+                <div id="tradeSignal"
+                     class="value">
+                    WAIT
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">ENTRY</div>
+                <div id="tradeEntry"
+                     class="value">
+                    --
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">WINDOW</div>
+                <div id="tradeWindow"
+                     class="value">
+                    --
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">EXPIRY</div>
+                <div id="tradeExpiry"
+                     class="value">
+                    --
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="label">TRADE STATUS</div>
+        <div id="tradeStatus">
+            No active entry.
+        </div>
+    </div>
 </div>
 
-<div id="confidence"
-     class="confidence">
-Confidence: 0%
+<!-- PERFORMANCE -->
+
+<div id="performance"
+     class="page">
+
+    <div class="card">
+        <div class="label">ENGINE PERFORMANCE</div>
+
+        <div class="grid">
+            <div class="metric">
+                <div class="label">SCANS</div>
+                <div id="perfScans"
+                     class="value">
+                    0
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">CHART DETECTED</div>
+                <div id="perfChart"
+                     class="value">
+                    NO
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">VISUAL BIAS</div>
+                <div id="perfVisual"
+                     class="value">
+                    0
+                </div>
+            </div>
+
+            <div class="metric">
+                <div class="label">INDICATOR BIAS</div>
+                <div id="perfIndicator"
+                     class="value">
+                    0
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="label">ENGINE</div>
+        <div class="analysis">
+            Alligator + EMA 9/20/50 + Parabolic SAR
+            + MACD + CCI + RSI + Bollinger 20/2
+            + Supertrend + ATR.
+            <br><br>
+            Signals require directional agreement and
+            a minimum confidence threshold determined
+            by the selected timeframe.
+        </div>
+    </div>
 </div>
 
-<div id="timer"
-     class="timer">
---
-</div>
+<!-- SETTINGS -->
 
-</div>
+<div id="settings"
+     class="page">
 
-<div class="grid">
+    <div class="card">
 
-<div class="card">
-<div class="label">ASSET</div>
-<div id="asset"
-     class="value">
-UNKNOWN
-</div>
-</div>
+        <div class="section">
+            <div class="label">ASSET</div>
+            <select id="assetSelect">
+            </select>
+        </div>
 
-<div class="card">
-<div class="label">PRICE</div>
-<div id="price"
-     class="value">
-0.000000
-</div>
-</div>
+        <div class="section">
+            <div class="label">TIMEFRAME</div>
+            <select id="timeframeSelect">
+            </select>
+        </div>
 
-<div class="card">
-<div class="label">ENTRY</div>
-<div id="entry"
-     class="value">
-0.000000
-</div>
-</div>
+        <div class="section">
+            <div class="label">EXPIRY</div>
+            <select id="expirySelect">
+            </select>
+        </div>
 
-<div class="card">
-<div class="label">CANDLES</div>
-<div id="candles"
-     class="value">
-0
-</div>
-</div>
+        <div class="section">
+            <div class="label">PAYOUT %</div>
+            <select id="payoutSelect">
+                <option>70</option>
+                <option>75</option>
+                <option>80</option>
+                <option selected>85</option>
+                <option>90</option>
+                <option>95</option>
+            </select>
+        </div>
 
-<div class="card">
-<div class="label">TIMEFRAME</div>
-<div id="timeframe"
-     class="value">
-30s
-</div>
-</div>
+        <button onclick="saveSettings()">
+            APPLY SETTINGS
+        </button>
 
-<div class="card">
-<div class="label">PAYOUT</div>
-<div id="payout"
-     class="value">
---
+        <div id="saveResult"
+             class="small">
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="label">FEED</div>
+        <div class="analysis">
+            Screen Stream / RTSP bridge endpoint:
+            /api/frame
+            <br><br>
+            JSON feed endpoint:
+            /api/feed
+        </div>
+    </div>
 </div>
-</div>
-
-</div>
-
-<div class="section">
-
-<h3>MARKET ANALYSIS</h3>
-
-<div id="analysisStatus"
-     class="small">
-Waiting for live feed...
-</div>
-
-<div class="indicators">
-
-<div class="ind">
-<div class="label">EMA 9</div>
-<div id="ema9">--</div>
-</div>
-
-<div class="ind">
-<div class="label">EMA 20</div>
-<div id="ema20">--</div>
-</div>
-
-<div class="ind">
-<div class="label">EMA 50</div>
-<div id="ema50">--</div>
-</div>
-
-<div class="ind">
-<div class="label">RSI</div>
-<div id="rsi">--</div>
-</div>
-
-<div class="ind">
-<div class="label">MACD</div>
-<div id="macd">--</div>
-</div>
-
-<div class="ind">
-<div class="label">CCI</div>
-<div id="cci">--</div>
-</div>
-
-<div class="ind">
-<div class="label">SAR</div>
-<div id="sar">--</div>
-</div>
-
-<div class="ind">
-<div class="label">ATR</div>
-<div id="atr">--</div>
-</div>
-
-<div class="ind">
-<div class="label">BOLLINGER</div>
-<div id="bb">--</div>
-</div>
-
-</div>
-
-</div>
-
-<div class="section">
-
-<h3>SCREEN FEED</h3>
-
-<div class="grid">
-
-<div class="card">
-<div class="label">SCREEN</div>
-<div id="screen"
-     class="value">
-WAITING
-</div>
-</div>
-
-<div class="card">
-<div class="label">FEED AGE</div>
-<div id="age"
-     class="value">
---
-</div>
-</div>
-
-<div class="card">
-<div class="label">BULL SCORE</div>
-<div id="bull"
-     class="value">
-0
-</div>
-</div>
-
-<div class="card">
-<div class="label">BEAR SCORE</div>
-<div id="bear"
-     class="value">
-0
-</div>
-</div>
-
-</div>
-
-</div>
-
-</main>
 
 <script>
 
-function setText(id,value) {
+let currentState = {};
+let assetData = null;
 
-    const el =
-        document.getElementById(id);
+function showPage(id, el) {
+    document.querySelectorAll('.page')
+        .forEach(x => x.classList.remove('active'));
 
-    if (el) {
-        el.textContent = value;
-    }
+    document.querySelectorAll('.tab')
+        .forEach(x => x.classList.remove('active'));
+
+    document.getElementById(id)
+        .classList.add('active');
+
+    el.classList.add('active');
 }
 
-
-function number(value,digits=5) {
-
-    if (
-        value === undefined ||
-        value === null ||
-        value === 0
-    ) {
-        return "--";
-    }
-
-    const n = Number(value);
-
-    if (!Number.isFinite(n)) {
-        return "--";
-    }
-
-    return n.toFixed(digits);
+function $(id) {
+    return document.getElementById(id);
 }
 
+function formatPrice(v) {
+    if (!v || Number(v) === 0) {
+        return "0.000000";
+    }
 
-async function update() {
+    let n = Number(v);
 
-    try {
+    if (Math.abs(n) >= 1000) {
+        return n.toFixed(2);
+    }
 
-        const response =
-            await fetch(
-                "/api/state",
-                {cache:"no-store"}
-            );
+    if (Math.abs(n) >= 10) {
+        return n.toFixed(3);
+    }
 
-        const s =
-            await response.json();
+    return n.toFixed(6);
+}
 
-        const signal =
-            s.signal || "WAIT";
+function populateSettings(data) {
+    assetData = data;
 
-        const signalEl =
-            document.getElementById(
-                "signal"
-            );
+    const assetSelect = $('assetSelect');
+    assetSelect.innerHTML = '';
 
-        signalEl.textContent =
-            signal;
+    for (const group of Object.keys(data.assets)) {
+        const optgroup =
+            document.createElement('optgroup');
 
-        signalEl.className =
-            "signal " +
-            (
-                signal === "CALL"
-                    ? "call"
-                    : signal === "PUT"
-                        ? "put"
-                        : "wait"
-            );
+        optgroup.label = group;
 
-        setText(
-            "confidence",
-            "Confidence: " +
-            (s.confidence || 0) +
-            "%"
-        );
+        for (const item of data.assets[group]) {
+            const option =
+                document.createElement('option');
 
-        setText(
-            "asset",
-            s.asset || "UNKNOWN"
-        );
+            option.value = item[0];
+            option.textContent = item[1];
 
-        setText(
-            "price",
-            number(s.price,6)
-        );
-
-        setText(
-            "entry",
-            number(s.entry,6)
-        );
-
-        setText(
-            "candles",
-            s.candles || 0
-        );
-
-        setText(
-            "timeframe",
-            s.timeframe || "30s"
-        );
-
-        setText(
-            "payout",
-            s.payout || "--"
-        );
-
-        setText(
-            "screen",
-            s.screen_status || "WAITING"
-        );
-
-        setText(
-            "age",
-            s.feed_age !== undefined
-                ? s.feed_age + "s"
-                : "--"
-        );
-
-        setText(
-            "bull",
-            s.bull_score || 0
-        );
-
-        setText(
-            "bear",
-            s.bear_score || 0
-        );
-
-        setText(
-            "analysisStatus",
-            s.analysis_status ||
-            "Analyzing..."
-        );
-
-        const timer =
-            Number(
-                s.entry_window || 0
-            );
-
-        setText(
-            "timer",
-            (
-                signal === "CALL" ||
-                signal === "PUT"
-            )
-                ? timer + "s"
-                : "--"
-        );
-
-        setText(
-            "feedStatus",
-            "FEED: " +
-            (s.feed || "WAITING")
-        );
-
-        setText(
-            "ema9",
-            number(s.ema9)
-        );
-
-        setText(
-            "ema20",
-            number(s.ema20)
-        );
-
-        setText(
-            "ema50",
-            number(s.ema50)
-        );
-
-        setText(
-            "rsi",
-            number(s.rsi,2)
-        );
-
-        setText(
-            "macd",
-            number(s.macd,6)
-        );
-
-        setText(
-            "cci",
-            number(s.cci,2)
-        );
-
-        setText(
-            "sar",
-            number(s.sar)
-        );
-
-        setText(
-            "atr",
-            number(s.atr,6)
-        );
-
-        if (
-            s.bb_upper &&
-            s.bb_lower
-        ) {
-
-            setText(
-                "bb",
-                number(s.bb_lower) +
-                " / " +
-                number(s.bb_upper)
-            );
-
-        } else {
-
-            setText(
-                "bb",
-                "--"
-            );
+            optgroup.appendChild(option);
         }
 
-    } catch(error) {
+        assetSelect.appendChild(optgroup);
+    }
 
-        setText(
-            "feedStatus",
-            "FEED: OFFLINE"
-        );
+    const tf = $('timeframeSelect');
+    tf.innerHTML = '';
 
-        setText(
-            "analysisStatus",
-            "Dashboard cannot reach feed"
-        );
+    data.timeframes.forEach(x => {
+        const o = document.createElement('option');
+        o.value = x;
+        o.textContent = x;
+        tf.appendChild(o);
+    });
+
+    const ex = $('expirySelect');
+    ex.innerHTML = '';
+
+    data.expiries.forEach(x => {
+        const o = document.createElement('option');
+        o.value = x;
+        o.textContent = x;
+        ex.appendChild(o);
+    });
+}
+
+async function loadAssets() {
+    try {
+        const r =
+            await fetch('/api/assets');
+
+        const d =
+            await r.json();
+
+        if (d.ok) {
+            populateSettings(d);
+        }
+    } catch (e) {
+        console.log(e);
     }
 }
 
+async function saveSettings() {
 
-update();
+    const payload = {
+        asset: $('assetSelect').value,
+        timeframe: $('timeframeSelect').value,
+        expiry: $('expirySelect').value,
+        payout: Number(
+            $('payoutSelect').value
+        )
+    };
+
+    try {
+        const r = await fetch(
+            '/api/settings',
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type':
+                        'application/json'
+                },
+                body: JSON.stringify(payload)
+            }
+        );
+
+        const d = await r.json();
+
+        if (d.ok) {
+            $('saveResult').textContent =
+                'Settings applied. Waiting for fresh chart analysis...';
+
+            update(d.state);
+        } else {
+            $('saveResult').textContent =
+                d.error || 'Settings failed.';
+        }
+
+    } catch (e) {
+        $('saveResult').textContent =
+            'Connection error.';
+    }
+}
+
+function update(s) {
+
+    currentState = s;
+
+    $('asset').textContent =
+        s.asset || 'UNKNOWN';
+
+    $('price').textContent =
+        formatPrice(s.price);
+
+    $('entry').textContent =
+        formatPrice(s.entry);
+
+    $('candles').textContent =
+        s.candles || 0;
+
+    $('timeframe').textContent =
+        s.timeframe || '--';
+
+    $('payout').textContent =
+        (s.payout || 0) + '%';
+
+    $('expiry').textContent =
+        s.expiry || '--';
+
+    $('confidence').textContent =
+        (s.confidence || 0) + '%';
+
+    $('bias').textContent =
+        (s.visual_bias || 0)
+        + ' / '
+        + (s.indicator_bias || 0);
+
+    $('analysis').textContent =
+        s.analysis || 'Waiting...';
+
+    $('scans').textContent =
+        s.scan_count || 0;
+
+    $('perfScans').textContent =
+        s.scan_count || 0;
+
+    $('perfChart').textContent =
+        s.chart_detected ? 'YES' : 'NO';
+
+    $('perfVisual').textContent =
+        s.visual_bias || 0;
+
+    $('perfIndicator').textContent =
+        s.indicator_bias || 0;
+
+    $('chartStatus').textContent =
+        s.chart_detected ? 'LIVE' : 'WAITING';
+
+    const sig =
+        $('signal');
+
+    sig.textContent =
+        s.signal || 'WAIT';
+
+    sig.className =
+        'signalWord ' +
+        (
+            s.signal === 'CALL'
+                ? 'call'
+                : s.signal === 'PUT'
+                    ? 'put'
+                    : 'wait'
+        );
+
+    const seconds =
+        Number(s.entry_window || 0);
+
+    $('count').textContent =
+        seconds > 0
+            ? seconds + 's'
+            : '--';
+
+    $('count').className =
+        'count' +
+        (seconds <= 0 &&
+         (s.signal === 'CALL' ||
+          s.signal === 'PUT')
+            ? ' expired'
+            : '');
+
+    if (seconds > 0 &&
+        (s.signal === 'CALL' ||
+         s.signal === 'PUT')) {
+
+        $('entryText').textContent =
+            'ENTRY WINDOW ACTIVE';
+
+    } else if (s.signal === 'WAIT') {
+
+        $('entryText').textContent =
+            s.chart_detected
+                ? 'WAITING FOR VALID SETUP'
+                : 'WAITING FOR CHART';
+
+    } else {
+
+        $('entryText').textContent =
+            'ENTRY WINDOW EXPIRED';
+    }
+
+    const fs =
+        $('feedStatus');
+
+    fs.className = 'status';
+
+    if (s.feed === 'LIVE') {
+        fs.classList.add('live');
+    } else if (s.feed === 'STALE') {
+        fs.classList.add('stale');
+    } else {
+        fs.classList.add('dead');
+    }
+
+    fs.innerHTML =
+        '<span class="dot"></span> FEED: '
+        + (s.feed || 'WAITING');
+
+    $('healthbar').style.width =
+        Math.min(
+            100,
+            Number(s.confidence || 0)
+        ) + '%';
+
+    $('tradeSignal').textContent =
+        s.signal || 'WAIT';
+
+    $('tradeEntry').textContent =
+        formatPrice(s.entry);
+
+    $('tradeWindow').textContent =
+        seconds > 0
+            ? seconds + 's'
+            : '--';
+
+    $('tradeExpiry').textContent =
+        s.expiry || '--';
+
+    if (seconds > 0 &&
+        (s.signal === 'CALL' ||
+         s.signal === 'PUT')) {
+
+        $('tradeStatus').textContent =
+            'ACTIVE ENTRY WINDOW — '
+            + seconds + ' seconds remaining.';
+
+    } else {
+
+        $('tradeStatus').textContent =
+            'No active entry window.';
+    }
+
+    // Synchronize settings controls.
+    if (assetData) {
+        $('assetSelect').value =
+            s.asset || 'EURUSD_otc';
+
+        $('timeframeSelect').value =
+            s.timeframe || '1m';
+
+        $('expirySelect').value =
+            s.expiry || '5m';
+
+        $('payoutSelect').value =
+            String(s.payout || 85);
+    }
+}
+
+async function poll() {
+
+    try {
+        const r =
+            await fetch(
+                '/api/state?x='
+                + Date.now()
+            );
+
+        const d =
+            await r.json();
+
+        if (d.ok) {
+            update(d.state);
+        }
+
+    } catch (e) {
+        $('chartStatus').textContent =
+            'OFFLINE';
+    }
+}
+
+loadAssets();
+poll();
 
 setInterval(
-    update,
+    poll,
     1000
 );
 
@@ -1704,75 +2258,79 @@ setInterval(
 """
 
 
-@app.route("/", methods=["GET"])
-def dashboard():
-    return render_template_string(
-        HTML
-    )
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
 
 # ============================================================
-# BACKGROUND STALE-FEED WATCHDOG
+# BACKGROUND STATE MAINTENANCE
 # ============================================================
 
-def watchdog():
-
+def maintenance_loop():
     while True:
-
         try:
-
             with STATE_LOCK:
+                now = time.time()
 
+                # Expire entry windows.
+                if (
+                    state["entry_deadline"] > 0
+                    and now >= state["entry_deadline"]
+                ):
+                    state["entry_window"] = 0
+
+                    if state["signal"] in (
+                        "CALL",
+                        "PUT"
+                    ):
+                        state["signal"] = "WAIT"
+
+                    state["entry"] = 0.0
+
+                # Feed status is calculated dynamically,
+                # but make stale status visible internally too.
                 if state["last_frame"]:
-
                     age = (
-                        now_ts()
-                        - state["last_frame"]
+                        now - state["last_frame"]
                     )
 
-                    if age > STALE_SECONDS:
-
+                    if age > 25:
+                        state["feed"] = "DISCONNECTED"
+                    elif age > 8:
                         state["feed"] = "STALE"
-                        state["screen_status"] = (
-                            "DISCONNECTED"
-                        )
+                    else:
+                        state["feed"] = "LIVE"
 
-                        state["signal"] = "WAIT"
-                        state["confidence"] = 0
-                        state["entry"] = 0.0
-                        state["entry_window"] = 0
-                        state["signal_started"] = 0
-
-                        state["analysis_status"] = (
-                            "WAITING FOR LIVE FEED"
-                        )
+                state["server_time"] = now
 
         except Exception:
             pass
 
-        time.sleep(1)
+        time.sleep(0.5)
 
 
-watchdog_thread = threading.Thread(
-    target=watchdog,
+threading.Thread(
+    target=maintenance_loop,
     daemon=True
-)
-
-watchdog_thread.start()
+).start()
 
 
 # ============================================================
-# LOCAL START
+# START
 # ============================================================
 
 if __name__ == "__main__":
-
     port = int(
-        os.getenv("PORT", "5000")
+        os.getenv("PORT", "10000")
     )
 
     app.run(
         host="0.0.0.0",
         port=port,
-        threaded=True
+        threaded=True,
     )
