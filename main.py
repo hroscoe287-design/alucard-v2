@@ -1,6 +1,7 @@
 import os
 import io
 import time
+import math
 import threading
 from datetime import datetime, timezone
 
@@ -10,945 +11,903 @@ from PIL import Image
 app = Flask(__name__)
 
 # ============================================================
-# ALUCARD V2.1 — GOTHIC MARKET INTELLIGENCE
-# COMPLETE SCREEN-FEED COMPATIBLE VERSION
+# ALUCARD V2.1
+# GOTHIC MARKET INTELLIGENCE
+# LIVE SCREEN-FEED SIGNAL ENGINE
 # ============================================================
 
 TOKEN = os.getenv("RYU_FEED_TOKEN", "").strip()
+
+MIN_CONFIDENCE = 78
+STALE_SECONDS = 8
+ENTRY_SECONDS = 12
+DEFAULT_TIMEFRAME = "30s"
 
 STATE_LOCK = threading.Lock()
 
 state = {
     "asset": "UNKNOWN",
     "price": 0.0,
+    "previous_price": 0.0,
 
     "signal": "WAIT",
     "confidence": 0,
 
     "entry": 0.0,
-    "entry_window": 12,
-
-    "countdown": 0,
-    "countdown_status": "WAITING",
+    "entry_window": 0,
+    "signal_started": 0,
 
     "candles": 0,
+    "timeframe": DEFAULT_TIMEFRAME,
+    "payout": "--",
 
     "feed": "WAITING",
-    "screen": "WAITING",
     "image_received": False,
-
-    "timeframe": "1m",
-    "payout": 0,
-
-    "analysis": "Waiting for usable market data.",
-
-    "last_update": 0,
     "last_frame": 0,
 
-    "signal_started": 0,
-    "signal_expires": 0,
+    "screen_status": "WAITING",
+    "analysis_status": "WAITING",
 
-    # Indicator values supplied by the feed.
     "ema9": 0.0,
     "ema20": 0.0,
     "ema50": 0.0,
-    "rsi": 0.0,
+    "rsi": 50.0,
     "macd": 0.0,
     "macd_signal": 0.0,
     "cci": 0.0,
     "sar": 0.0,
-    "supertrend": 0.0,
     "atr": 0.0,
-    "bollinger_upper": 0.0,
-    "bollinger_middle": 0.0,
-    "bollinger_lower": 0.0,
+    "bb_upper": 0.0,
+    "bb_middle": 0.0,
+    "bb_lower": 0.0,
+
+    "bull_score": 0,
+    "bear_score": 0,
+
+    "updated": "",
 }
 
+# Rolling close prices.
+prices = []
 
-# ============================================================
-# POCKET OPTION ASSET MENU
-# ============================================================
-
-ASSETS = {
-    "Currency": [
-        "EUR/USD",
-        "GBP/USD",
-        "USD/JPY",
-        "USD/CHF",
-        "USD/CAD",
-        "AUD/USD",
-        "NZD/USD",
-        "EUR/GBP",
-        "EUR/JPY",
-        "GBP/JPY",
-        "AUD/JPY",
-        "AUD/CAD",
-        "AUD/CHF",
-        "AUD/NZD",
-        "CAD/JPY",
-        "CAD/CHF",
-        "CHF/JPY",
-        "EUR/CHF",
-        "EUR/NZD",
-        "GBP/AUD",
-        "GBP/CHF",
-        "NZD/JPY"
-    ],
-
-    "OTC Currency": [
-        "EUR/USD OTC",
-        "GBP/USD OTC",
-        "USD/JPY OTC",
-        "USD/CHF OTC",
-        "USD/CAD OTC",
-        "AUD/USD OTC",
-        "NZD/USD OTC",
-        "EUR/GBP OTC",
-        "EUR/JPY OTC",
-        "GBP/JPY OTC",
-        "AUD/JPY OTC",
-        "AUD/CAD OTC",
-        "AUD/CHF OTC",
-        "AUD/NZD OTC",
-        "CAD/JPY OTC",
-        "CAD/CHF OTC",
-        "CHF/JPY OTC",
-        "EUR/CHF OTC",
-        "EUR/NZD OTC",
-        "GBP/AUD OTC",
-        "NZD/JPY OTC",
-        "EUR/TRY OTC",
-        "EUR/HUF OTC",
-        "EUR/RUB OTC",
-        "USD/RUB OTC",
-        "USD/CNH OTC",
-        "USD/INR OTC",
-        "USD/IDR OTC",
-        "USD/MYR OTC",
-        "USD/SGD OTC",
-        "USD/THB OTC",
-        "USD/VND OTC",
-        "USD/PKR OTC",
-        "USD/PHP OTC",
-        "USD/BDT OTC",
-        "USD/EGP OTC",
-        "USD/DZD OTC",
-        "USD/CLP OTC",
-        "USD/COP OTC",
-        "USD/MXN OTC",
-        "USD/BRL OTC",
-        "USD/ARS OTC",
-        "KES/USD OTC",
-        "NGN/USD OTC",
-        "ZAR/USD OTC",
-        "YER/USD OTC",
-        "TND/USD OTC",
-        "MAD/USD OTC",
-        "UAH/USD OTC",
-        "LBP/USD OTC",
-        "BHD/CNY OTC",
-        "AED/CNY OTC",
-        "SAR/CNY OTC",
-        "QAR/CNY OTC",
-        "OMR/CNY OTC",
-        "JOD/CNY OTC"
-    ],
-
-    "Commodities": [
-        "Gold",
-        "Silver",
-        "Brent Oil",
-        "WTI Crude Oil",
-        "Natural Gas",
-        "Platinum spot",
-        "Palladium spot"
-    ],
-
-    "OTC Commodities": [
-        "Gold OTC",
-        "Silver OTC",
-        "Brent Oil OTC",
-        "WTI Crude Oil OTC",
-        "Natural Gas OTC",
-        "Platinum spot OTC",
-        "Palladium spot OTC"
-    ],
-
-    "Stocks": [
-        "Apple",
-        "Microsoft",
-        "Amazon",
-        "Tesla",
-        "Intel",
-        "Cisco",
-        "Netflix",
-        "Alibaba",
-        "VISA",
-        "American Express",
-        "Boeing Company",
-        "ExxonMobil",
-        "McDonald's",
-        "Johnson & Johnson",
-        "Pfizer Inc",
-        "FedEx",
-        "Citigroup Inc",
-        "GameStop Corp",
-        "FACEBOOK INC",
-        "Advanced Micro Devices",
-        "Palantir Technologies",
-        "Coinbase Global",
-        "Marathon Digital Holdings"
-    ],
-
-    "OTC Stocks": [
-        "Apple OTC",
-        "Microsoft OTC",
-        "Amazon OTC",
-        "Tesla OTC",
-        "Intel OTC",
-        "Cisco OTC",
-        "Netflix OTC",
-        "Alibaba OTC",
-        "VISA OTC",
-        "American Express OTC",
-        "Boeing Company OTC",
-        "ExxonMobil OTC",
-        "McDonald's OTC",
-        "Johnson & Johnson OTC",
-        "Pfizer Inc OTC",
-        "FedEx OTC",
-        "Citigroup Inc OTC",
-        "GameStop Corp OTC",
-        "FACEBOOK INC OTC",
-        "Advanced Micro Devices OTC",
-        "Palantir Technologies OTC",
-        "Coinbase Global OTC",
-        "Marathon Digital Holdings OTC",
-        "VIX OTC"
-    ],
-
-    "Indices": [
-        "US100",
-        "SP500",
-        "DJI30",
-        "D30/EUR",
-        "E35EUR",
-        "E50EUR",
-        "F40EUR",
-        "100GBP",
-        "JPN225",
-        "AUS 200",
-        "CAC 40",
-        "HONG KONG 33"
-    ],
-
-    "OTC Indices": [
-        "US100 OTC",
-        "SP500 OTC",
-        "DJI30 OTC",
-        "D30EUR OTC",
-        "E35EUR OTC",
-        "E50EUR OTC",
-        "F40EUR OTC",
-        "100GBP OTC",
-        "JPN225 OTC",
-        "AUS 200 OTC"
-    ],
-
-    "Cryptocurrencies": [
-        "Bitcoin",
-        "Ethereum",
-        "Litecoin",
-        "Bitcoin ETF",
-        "BCH/EUR",
-        "BCH/GBP",
-        "BCH/JPY",
-        "BTC/GBP",
-        "BTC/JPY",
-        "Chainlink",
-        "Dash",
-        "BNB",
-        "Solana",
-        "Cardano",
-        "TRON",
-        "Toncoin",
-        "Avalanche",
-        "Dogecoin",
-        "Polkadot",
-        "Polygon"
-    ],
-
-    "OTC Crypto": [
-        "Bitcoin OTC",
-        "Ethereum OTC",
-        "Litecoin OTC",
-        "Bitcoin ETF OTC",
-        "BNB OTC",
-        "Solana OTC",
-        "Cardano OTC",
-        "TRON OTC",
-        "Dogecoin OTC",
-        "Polkadot OTC",
-        "Polygon OTC",
-        "Chainlink OTC",
-        "Avalanche OTC"
-    ]
-}
-
-
-TIMEFRAMES = {
-    "5s": 5,
-    "15s": 15,
-    "30s": 30,
-    "1m": 60,
-    "2m": 120,
-    "3m": 180,
-    "5m": 300,
-    "15m": 900,
-    "30m": 1800,
-    "1h": 3600,
-    "4h": 14400,
-    "1d": 86400
-}
-
+# Detected screen colors / direction history.
+direction_history = []
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def now():
+def now_ts():
     return time.time()
 
 
-def clean_number(value, default=0.0):
+def iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_float(value, default=0.0):
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        if value is None:
+            return default
+
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+
+        result = float(value)
+
+        if math.isfinite(result):
+            return result
+
+    except Exception:
+        pass
+
+    return default
 
 
-def clean_int(value, default=0):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-def token_valid(req):
+def check_token():
     if not TOKEN:
         return True
 
     supplied = (
-        req.headers.get("X-RYU-TOKEN")
-        or req.headers.get("X-ALUCARD-TOKEN")
-        or req.args.get("token")
+        request.headers.get("X-RYU-TOKEN")
+        or request.headers.get("X-RYU-FEED-TOKEN")
+        or request.args.get("token")
+        or ""
     )
 
-    return supplied == TOKEN
+    return supplied.strip() == TOKEN
 
 
-def normalize_asset(asset):
-    """
-    Converts common Pocket Option naming formats into a
-    readable dashboard name.
-    """
+# ============================================================
+# INDICATORS
+# ============================================================
 
-    if not asset:
-        return "UNKNOWN"
+def ema(values, period):
+    if not values:
+        return 0.0
 
-    text = str(asset).strip()
+    if len(values) == 1:
+        return values[-1]
 
-    replacements = {
-        "EURUSD_otc": "EUR/USD OTC",
-        "EURUSD OTC": "EUR/USD OTC",
-        "GBPUSD_otc": "GBP/USD OTC",
-        "GBPUSD OTC": "GBP/USD OTC",
-        "USDJPY_otc": "USD/JPY OTC",
-        "USDJPY OTC": "USD/JPY OTC",
-        "USDCHF_otc": "USD/CHF OTC",
-        "USDCHF OTC": "USD/CHF OTC",
-        "USDCAD_otc": "USD/CAD OTC",
-        "USDCAD OTC": "USD/CAD OTC",
-        "AUDUSD_otc": "AUD/USD OTC",
-        "AUDUSD OTC": "AUD/USD OTC",
-        "NZDUSD_otc": "NZD/USD OTC",
-        "NZDUSD OTC": "NZD/USD OTC",
-        "EURGBP_otc": "EUR/GBP OTC",
-        "EURGBP OTC": "EUR/GBP OTC",
-        "EURJPY_otc": "EUR/JPY OTC",
-        "EURJPY OTC": "EUR/JPY OTC",
-        "GBPJPY_otc": "GBP/JPY OTC",
-        "GBPJPY OTC": "GBP/JPY OTC",
-        "AUDJPY_otc": "AUD/JPY OTC",
-        "AUDJPY OTC": "AUD/JPY OTC",
-    }
+    alpha = 2.0 / (period + 1.0)
 
-    if text in replacements:
-        return replacements[text]
+    result = values[0]
 
-    # Normal forex symbols.
-    compact = text.replace("/", "").replace("_otc", "").replace("_OTC", "")
+    for value in values[1:]:
+        result = (value * alpha) + (result * (1.0 - alpha))
 
-    forex_map = {
-        "EURUSD": "EUR/USD",
-        "GBPUSD": "GBP/USD",
-        "USDJPY": "USD/JPY",
-        "USDCHF": "USD/CHF",
-        "USDCAD": "USD/CAD",
-        "AUDUSD": "AUD/USD",
-        "NZDUSD": "NZD/USD",
-        "EURGBP": "EUR/GBP",
-        "EURJPY": "EUR/JPY",
-        "GBPJPY": "GBP/JPY",
-        "AUDJPY": "AUD/JPY",
-        "AUDCAD": "AUD/CAD",
-        "AUDCHF": "AUD/CHF",
-        "AUDNZD": "AUD/NZD",
-        "CADJPY": "CAD/JPY",
-        "CADCHF": "CAD/CHF",
-        "CHFJPY": "CHF/JPY",
-        "EURCHF": "EUR/CHF",
-        "EURNZD": "EUR/NZD",
-        "GBPAUD": "GBP/AUD",
-        "GBPCHF": "GBP/CHF",
-        "NZDJPY": "NZD/JPY"
-    }
-
-    if compact.upper() in forex_map:
-        result = forex_map[compact.upper()]
-
-        if "otc" in text.lower():
-            result += " OTC"
-
-        return result
-
-    return text
+    return result
 
 
-def update_signal_timing():
-    current = now()
+def sma(values, period):
+    if not values:
+        return 0.0
 
-    with STATE_LOCK:
-        expires = float(
-            state.get("signal_expires", 0) or 0
-        )
+    data = values[-period:]
 
-        if expires > current:
+    return sum(data) / len(data)
 
-            remaining = max(
-                0,
-                int(expires - current)
-            )
 
-            state["countdown"] = remaining
-            state["countdown_status"] = "ENTRY OPEN"
+def rsi(values, period=14):
+    if len(values) < 2:
+        return 50.0
 
-        elif expires > 0:
+    data = values[-(period + 1):]
 
-            state["countdown"] = 0
-            state["countdown_status"] = "EXPIRED"
+    gains = []
+    losses = []
 
-            if state["signal"] in ("CALL", "PUT"):
+    for i in range(1, len(data)):
+        change = data[i] - data[i - 1]
 
-                state["signal"] = "WAIT"
-
-                state["analysis"] = (
-                    "Entry window expired. "
-                    "Waiting for next confirmed signal."
-                )
-
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
         else:
+            gains.append(0.0)
+            losses.append(abs(change))
 
-            state["countdown"] = 0
-            state["countdown_status"] = "WAITING"
+    avg_gain = sum(gains) / len(gains)
+    avg_loss = sum(losses) / len(losses)
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def feed_is_alive():
-    current = now()
+def bollinger(values, period=20, multiplier=2.0):
+    if not values:
+        return 0.0, 0.0, 0.0
 
-    with STATE_LOCK:
-        last = float(
-            state.get("last_update", 0) or 0
-        )
+    data = values[-period:]
+
+    middle = sum(data) / len(data)
+
+    variance = sum(
+        (x - middle) ** 2 for x in data
+    ) / len(data)
+
+    std = math.sqrt(max(variance, 0.0))
 
     return (
-        last > 0
-        and (current - last) <= 15
+        middle + multiplier * std,
+        middle,
+        middle - multiplier * std,
     )
+
+
+def macd(values):
+    if not values:
+        return 0.0, 0.0
+
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    line = fast - slow
+
+    macd_values = []
+
+    start = max(0, len(values) - 60)
+
+    for i in range(start, len(values)):
+        subset = values[:i + 1]
+
+        macd_values.append(
+            ema(subset, 12) - ema(subset, 26)
+        )
+
+    signal_line = ema(macd_values, 9) if macd_values else line
+
+    return line, signal_line
+
+
+def cci(values, period=20):
+    if len(values) < 2:
+        return 0.0
+
+    data = values[-period:]
+
+    middle = sum(data) / len(data)
+
+    deviation = sum(abs(x - middle) for x in data) / len(data)
+
+    if deviation == 0:
+        return 0.0
+
+    return (data[-1] - middle) / (0.015 * deviation)
+
+
+def atr(values, period=14):
+    if len(values) < 2:
+        return 0.0
+
+    changes = [
+        abs(values[i] - values[i - 1])
+        for i in range(1, len(values))
+    ]
+
+    return sum(changes[-period:]) / min(
+        period,
+        len(changes)
+    )
+
+
+def parabolic_sar_proxy(values):
+    """
+    Screenshot/price-feed compatible SAR proxy.
+
+    When only close prices are supplied rather than complete
+    OHLC candles, this gives a directional SAR-style reference.
+    """
+
+    if len(values) < 3:
+        return values[-1] if values else 0.0
+
+    recent = values[-14:]
+
+    low = min(recent)
+    high = max(recent)
+
+    current = recent[-1]
+
+    if current >= sma(recent, len(recent)):
+        return low
+    else:
+        return high
+
+
+def alligator_proxy(values):
+    """
+    Williams Alligator-style moving-average relationship.
+
+    With close-only feed data we approximate:
+    jaw   = EMA 13
+    teeth = EMA 8
+    lips  = EMA 5
+    """
+
+    return (
+        ema(values, 13),
+        ema(values, 8),
+        ema(values, 5),
+    )
+
+
+def supertrend_proxy(values):
+    """
+    Close-only Supertrend approximation.
+    """
+
+    if len(values) < 2:
+        return 0.0
+
+    middle = ema(values, 10)
+    volatility = atr(values, 10)
+
+    current = values[-1]
+
+    if current >= middle:
+        return middle - (2.0 * volatility)
+
+    return middle + (2.0 * volatility)
 
 
 # ============================================================
 # SIGNAL ENGINE
 # ============================================================
 
-def calculate_signal(data):
-    """
-    Uses supplied indicator values.
-
-    The engine requires multiple confirmations rather than
-    generating a signal from a screenshot alone.
-
-    If an upstream feed already supplies CALL/PUT with a
-    confidence value, that signal is preserved.
-
-    If enough indicator values are supplied, ALUCARD can
-    calculate a signal.
-    """
-
-    supplied_signal = str(
-        data.get("signal", "")
-    ).upper().strip()
-
-    supplied_confidence = clean_int(
-        data.get("confidence", 0)
-    )
-
-    # --------------------------------------------------------
-    # Preserve a legitimate upstream signal.
-    # --------------------------------------------------------
-
-    if supplied_signal in ("CALL", "PUT"):
-
-        return (
-            supplied_signal,
-            max(
-                0,
-                min(100, supplied_confidence)
-            ),
-            "Signal received from market feed."
-        )
-
-    # --------------------------------------------------------
-    # Gather indicators.
-    # --------------------------------------------------------
-
-    price = clean_number(data.get("price"))
-
-    ema9 = clean_number(data.get("ema9"))
-    ema20 = clean_number(data.get("ema20"))
-    ema50 = clean_number(data.get("ema50"))
-
-    rsi = clean_number(data.get("rsi"))
-    macd = clean_number(data.get("macd"))
-    macd_signal = clean_number(
-        data.get("macd_signal")
-    )
-
-    cci = clean_number(data.get("cci"))
-    sar = clean_number(data.get("sar"))
-    supertrend = clean_number(
-        data.get("supertrend")
-    )
-
-    upper = clean_number(
-        data.get("bollinger_upper")
-    )
-
-    middle = clean_number(
-        data.get("bollinger_middle")
-    )
-
-    lower = clean_number(
-        data.get("bollinger_lower")
-    )
-
-    # Need enough information to calculate anything.
-    available = sum([
-        price > 0,
-        ema9 > 0,
-        ema20 > 0,
-        ema50 > 0,
-        rsi > 0,
-        macd != 0,
-        macd_signal != 0,
-        cci != 0,
-        sar > 0,
-        supertrend > 0,
-        middle > 0
-    ])
-
-    if available < 4:
-
-        return (
-            "WAIT",
-            0,
-            "Waiting for enough market indicators."
-        )
-
-    call_score = 0
-    put_score = 0
-    total = 0
-
-    # EMA trend.
-    if ema9 > 0 and ema20 > 0:
-        total += 1
-
-        if ema9 > ema20:
-            call_score += 1
-        elif ema9 < ema20:
-            put_score += 1
-
-    if ema20 > 0 and ema50 > 0:
-        total += 1
-
-        if ema20 > ema50:
-            call_score += 1
-        elif ema20 < ema50:
-            put_score += 1
-
-    # RSI.
-    if rsi > 0:
-        total += 1
-
-        if 52 <= rsi <= 70:
-            call_score += 1
-        elif 30 <= rsi <= 48:
-            put_score += 1
-
-    # MACD.
-    if macd != 0 or macd_signal != 0:
-        total += 1
-
-        if macd > macd_signal:
-            call_score += 1
-        elif macd < macd_signal:
-            put_score += 1
-
-    # CCI.
-    if cci != 0:
-        total += 1
-
-        if cci > 50:
-            call_score += 1
-        elif cci < -50:
-            put_score += 1
-
-    # Parabolic SAR.
-    if price > 0 and sar > 0:
-        total += 1
-
-        if price > sar:
-            call_score += 1
-        elif price < sar:
-            put_score += 1
-
-    # Supertrend.
-    if price > 0 and supertrend > 0:
-        total += 1
-
-        if price > supertrend:
-            call_score += 1
-        elif price < supertrend:
-            put_score += 1
-
-    # Bollinger position.
-    if (
-        price > 0
-        and upper > middle > 0
-        and lower > 0
-    ):
-        total += 1
-
-        if price > middle:
-            call_score += 1
-        elif price < middle:
-            put_score += 1
-
-    if total <= 0:
-        return (
-            "WAIT",
-            0,
-            "Waiting for indicator confirmation."
-        )
-
-    call_percent = (
-        call_score / total
-    ) * 100
-
-    put_percent = (
-        put_score / total
-    ) * 100
-
-    # Require strong agreement.
-    if call_percent >= 78 and call_score > put_score:
-
-        return (
-            "CALL",
-            int(call_percent),
-            "Multiple bullish indicators confirmed."
-        )
-
-    if put_percent >= 78 and put_score > call_score:
-
-        return (
-            "PUT",
-            int(put_percent),
-            "Multiple bearish indicators confirmed."
-        )
-
-    return (
-        "WAIT",
-        int(max(call_percent, put_percent)),
-        "Indicators are not sufficiently aligned."
-    )
-
-
-# ============================================================
-# API — STATE
-# ============================================================
-
-@app.route("/api/state", methods=["GET"])
-def api_state():
-
-    update_signal_timing()
+def calculate_signal():
+    global prices
 
     with STATE_LOCK:
-        result = dict(state)
+        data = list(prices)
 
-    result["feed_alive"] = feed_is_alive()
+    if len(data) < 30:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "bull": 0,
+            "bear": 0,
+            "indicators": {},
+        }
 
-    result["server_time"] = (
-        datetime.now(timezone.utc).isoformat()
+    current = data[-1]
+
+    ema9_value = ema(data, 9)
+    ema20_value = ema(data, 20)
+    ema50_value = ema(data, 50)
+
+    rsi_value = rsi(data, 14)
+
+    macd_value, macd_signal_value = macd(data)
+
+    cci_value = cci(data, 20)
+
+    bb_upper, bb_middle, bb_lower = bollinger(
+        data,
+        20,
+        2.0
     )
 
-    if result["feed_alive"]:
+    atr_value = atr(data, 14)
 
-        result["feed"] = "LIVE"
+    sar_value = parabolic_sar_proxy(data)
 
-        # Screen can remain LIVE when a recent frame exists.
-        if (
-            result.get("last_frame", 0)
-            and now() - float(result["last_frame"]) <= 15
-        ):
-            result["screen"] = "LIVE"
+    jaw, teeth, lips = alligator_proxy(data)
+
+    supertrend = supertrend_proxy(data)
+
+    bull = 0
+    bear = 0
+
+    # --------------------------------------------------------
+    # EMA TREND
+    # --------------------------------------------------------
+
+    if ema9_value > ema20_value:
+        bull += 10
+    elif ema9_value < ema20_value:
+        bear += 10
+
+    if ema20_value > ema50_value:
+        bull += 10
+    elif ema20_value < ema50_value:
+        bear += 10
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if 52 <= rsi_value <= 70:
+        bull += 10
+    elif 30 <= rsi_value <= 48:
+        bear += 10
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    if macd_value > macd_signal_value:
+        bull += 12
+    elif macd_value < macd_signal_value:
+        bear += 12
+
+    # --------------------------------------------------------
+    # CCI
+    # --------------------------------------------------------
+
+    if cci_value > 50:
+        bull += 10
+    elif cci_value < -50:
+        bear += 10
+
+    # --------------------------------------------------------
+    # BOLLINGER
+    # --------------------------------------------------------
+
+    if bb_middle > 0:
+
+        if current > bb_middle:
+            bull += 8
+
+        elif current < bb_middle:
+            bear += 8
+
+    # --------------------------------------------------------
+    # PARABOLIC SAR
+    # --------------------------------------------------------
+
+    if current > sar_value:
+        bull += 10
+    elif current < sar_value:
+        bear += 10
+
+    # --------------------------------------------------------
+    # ALLIGATOR
+    # --------------------------------------------------------
+
+    if lips > teeth > jaw:
+        bull += 12
+
+    elif lips < teeth < jaw:
+        bear += 12
+
+    # --------------------------------------------------------
+    # SUPERTREND
+    # --------------------------------------------------------
+
+    if current > supertrend:
+        bull += 10
+    elif current < supertrend:
+        bear += 10
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if len(data) >= 5:
+
+        momentum = current - data[-5]
+
+        if momentum > 0:
+            bull += 8
+        elif momentum < 0:
+            bear += 8
+
+    total = bull + bear
+
+    if total <= 0:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "bull": bull,
+            "bear": bear,
+            "indicators": {},
+        }
+
+    dominant = max(bull, bear)
+
+    confidence = int(
+        round((dominant / total) * 100)
+    )
+
+    # Prevent false confidence from a nearly balanced market.
+    difference = abs(bull - bear)
+
+    if difference < 12:
+        signal = "WAIT"
+        confidence = min(confidence, 65)
+
+    elif bull > bear and confidence >= MIN_CONFIDENCE:
+        signal = "CALL"
+
+    elif bear > bull and confidence >= MIN_CONFIDENCE:
+        signal = "PUT"
 
     else:
+        signal = "WAIT"
 
-        if result["last_update"] == 0:
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "bull": bull,
+        "bear": bear,
+        "indicators": {
+            "ema9": ema9_value,
+            "ema20": ema20_value,
+            "ema50": ema50_value,
+            "rsi": rsi_value,
+            "macd": macd_value,
+            "macd_signal": macd_signal_value,
+            "cci": cci_value,
+            "sar": sar_value,
+            "atr": atr_value,
+            "bb_upper": bb_upper,
+            "bb_middle": bb_middle,
+            "bb_lower": bb_lower,
+            "alligator_jaw": jaw,
+            "alligator_teeth": teeth,
+            "alligator_lips": lips,
+            "supertrend": supertrend,
+        },
+    }
 
-            result["feed"] = "WAITING"
-            result["screen"] = "WAITING"
+
+# ============================================================
+# PRICE FEED
+# ============================================================
+
+def add_price(price):
+    global prices
+
+    price = safe_float(price)
+
+    if price <= 0:
+        return False
+
+    with STATE_LOCK:
+
+        state["previous_price"] = (
+            prices[-1] if prices else price
+        )
+
+        prices.append(price)
+
+        # Keep a rolling history.
+        if len(prices) > 500:
+            prices = prices[-500:]
+
+        state["price"] = price
+        state["candles"] = len(prices)
+        state["last_frame"] = now_ts()
+        state["feed"] = "LIVE"
+        state["screen_status"] = "LIVE"
+        state["updated"] = iso_now()
+
+    return True
+
+
+# ============================================================
+# SIGNAL UPDATE
+# ============================================================
+
+def update_signal():
+
+    result = calculate_signal()
+
+    signal = result["signal"]
+    confidence = result["confidence"]
+
+    with STATE_LOCK:
+
+        previous_signal = state["signal"]
+
+        state["bull_score"] = result["bull"]
+        state["bear_score"] = result["bear"]
+
+        indicators = result["indicators"]
+
+        for key, value in indicators.items():
+
+            if key in state:
+                state[key] = round(
+                    safe_float(value),
+                    8
+                )
+
+        # New valid signal.
+        if signal in ("CALL", "PUT"):
+
+            # Start/restart timer when signal direction changes
+            # or the previous signal expired.
+            expired = (
+                state["signal_started"] <= 0
+                or (
+                    now_ts()
+                    - state["signal_started"]
+                    > ENTRY_SECONDS
+                )
+            )
+
+            if (
+                previous_signal != signal
+                or expired
+            ):
+                state["signal_started"] = now_ts()
+                state["entry"] = state["price"]
+
+            state["signal"] = signal
+            state["confidence"] = confidence
+            state["analysis_status"] = "SIGNAL ACTIVE"
 
         else:
 
-            result["feed"] = "DISCONNECTED"
-            result["screen"] = "OFFLINE"
+            # Don't leave a dead CALL/PUT displayed indefinitely.
+            state["signal"] = "WAIT"
+            state["confidence"] = confidence
+            state["entry"] = 0.0
+            state["signal_started"] = 0
+            state["entry_window"] = 0
+            state["analysis_status"] = "ANALYZING"
 
-    return jsonify(result)
+        state["updated"] = iso_now()
 
 
 # ============================================================
-# API — JSON MARKET FEED
+# SCREEN IMAGE ANALYSIS
+# ============================================================
+
+def analyze_screen_image(image):
+    """
+    Extract directional information from a Pocket Option
+    screenshot.
+
+    This intentionally does NOT invent an exact price or asset.
+
+    It looks for green/red candle pixels and converts their
+    relative balance into directional price observations.
+    """
+
+    try:
+
+        image = image.convert("RGB")
+
+        width, height = image.size
+
+        if width < 50 or height < 50:
+            return None
+
+        # Chart is normally in the middle/right portion of the
+        # Pocket Option interface.
+        left = int(width * 0.20)
+        right = int(width * 0.95)
+
+        top = int(height * 0.20)
+        bottom = int(height * 0.85)
+
+        crop = image.crop(
+            (left, top, right, bottom)
+        )
+
+        cw, ch = crop.size
+
+        green = 0
+        red = 0
+
+        # Sample pixels rather than processing every pixel.
+        step_x = max(1, cw // 180)
+        step_y = max(1, ch // 120)
+
+        for y in range(0, ch, step_y):
+
+            for x in range(0, cw, step_x):
+
+                r, g, b = crop.getpixel((x, y))
+
+                # Green candle/body/wick.
+                if (
+                    g > r * 1.18
+                    and g > b * 1.08
+                    and g > 70
+                ):
+                    green += 1
+
+                # Red candle/body/wick.
+                elif (
+                    r > g * 1.18
+                    and r > b * 1.10
+                    and r > 70
+                ):
+                    red += 1
+
+        total = green + red
+
+        if total < 5:
+            return {
+                "direction": "UNKNOWN",
+                "strength": 0.0,
+            }
+
+        if green > red:
+            direction = "UP"
+            strength = green / total
+        else:
+            direction = "DOWN"
+            strength = red / total
+
+        return {
+            "direction": direction,
+            "strength": float(strength),
+            "green": green,
+            "red": red,
+        }
+
+    except Exception:
+        return None
+
+
+def image_to_price_observation(analysis):
+    """
+    Converts detected screen direction into a small synthetic
+    observation only when the image feed does not provide an
+    actual price.
+
+    This is deliberately kept separate from actual price data.
+    """
+
+    if not analysis:
+        return None
+
+    direction = analysis.get("direction")
+
+    strength = safe_float(
+        analysis.get("strength"),
+        0.0
+    )
+
+    if direction == "UNKNOWN":
+        return None
+
+    # If no actual price exists, use a normalized internal series.
+    with STATE_LOCK:
+        current = (
+            prices[-1]
+            if prices
+            else 100.0
+        )
+
+    movement = 0.0005 * max(
+        0.25,
+        strength
+    )
+
+    if direction == "UP":
+        return current * (1.0 + movement)
+
+    return current * (1.0 - movement)
+
+
+# ============================================================
+# FEED ENDPOINT
 # ============================================================
 
 @app.route("/api/feed", methods=["POST"])
 def api_feed():
 
-    if not token_valid(request):
-
+    if not check_token():
         return jsonify({
             "ok": False,
             "error": "Invalid feed token"
         }), 401
 
-    data = request.get_json(silent=True)
+    data = request.get_json(
+        silent=True
+    )
 
     if not isinstance(data, dict):
-
         return jsonify({
             "ok": False,
             "error": "No JSON data received"
         }), 400
 
-    asset = normalize_asset(
-        data.get(
-            "asset",
-            state["asset"]
-        )
+    asset = (
+        data.get("asset")
+        or data.get("symbol")
+        or data.get("pair")
     )
 
-    price = clean_number(
-        data.get(
-            "price",
-            state["price"]
-        )
+    price = (
+        data.get("price")
+        or data.get("current_price")
+        or data.get("last")
     )
 
-    candles = max(
-        0,
-        clean_int(
-            data.get(
-                "candles",
-                state["candles"]
-            )
-        )
+    timeframe = (
+        data.get("timeframe")
+        or state["timeframe"]
     )
 
-    timeframe = str(
-        data.get(
-            "timeframe",
-            state["timeframe"]
-        ) or "1m"
+    payout = (
+        data.get("payout")
+        or state["payout"]
     )
 
-    if timeframe not in TIMEFRAMES:
-        timeframe = "1m"
+    # --------------------------------------------------------
+    # Accept supplied candle closes if available.
+    # --------------------------------------------------------
 
-    signal, confidence, signal_analysis = (
-        calculate_signal(data)
+    candle_values = (
+        data.get("prices")
+        or data.get("closes")
+        or data.get("candles")
     )
 
-    entry = clean_number(
-        data.get(
-            "entry",
-            price
-        )
-    )
+    added = False
 
-    payout = clean_int(
-        data.get(
-            "payout",
-            state["payout"]
-        )
-    )
+    if isinstance(candle_values, list):
 
-    current = now()
+        for value in candle_values[-100:]:
+
+            value = safe_float(value)
+
+            if value > 0:
+                add_price(value)
+                added = True
+
+    # --------------------------------------------------------
+    # Accept current price.
+    # --------------------------------------------------------
+
+    if price is not None:
+
+        if add_price(price):
+            added = True
 
     with STATE_LOCK:
 
-        state["asset"] = asset
-        state["price"] = price
+        if asset:
+            state["asset"] = str(asset)
 
-        state["signal"] = signal
-        state["confidence"] = confidence
-
-        state["entry"] = entry
-
-        state["candles"] = candles
+        state["timeframe"] = str(timeframe)
+        state["payout"] = str(payout)
 
         state["feed"] = "LIVE"
-        state["screen"] = (
-            "LIVE"
-            if state.get("last_frame", 0)
-            and current - float(
-                state.get("last_frame", 0)
-            ) <= 15
-            else state.get("screen", "LIVE")
-        )
+        state["screen_status"] = "LIVE"
+        state["last_frame"] = now_ts()
+        state["updated"] = iso_now()
 
-        state["image_received"] = bool(
-            state.get("last_frame", 0)
-        )
+    if added:
+        update_signal()
 
-        state["timeframe"] = timeframe
-
-        state["payout"] = payout
-
-        state["analysis"] = str(
-            data.get(
-                "analysis",
-                signal_analysis
-            )
-        )
-
-        # Store indicators.
-        for key in (
-            "ema9",
-            "ema20",
-            "ema50",
-            "rsi",
-            "macd",
-            "macd_signal",
-            "cci",
-            "sar",
-            "supertrend",
-            "atr",
-            "bollinger_upper",
-            "bollinger_middle",
-            "bollinger_lower"
-        ):
-            if key in data:
-                state[key] = clean_number(
-                    data.get(key)
-                )
-
-        state["last_update"] = current
-
-        # ----------------------------------------------------
-        # Start a fresh entry countdown only for a new
-        # confirmed CALL or PUT.
-        # ----------------------------------------------------
-
-        if signal in ("CALL", "PUT"):
-
-            state["signal_started"] = current
-
-            state["signal_expires"] = (
-                current
-                + state["entry_window"]
-            )
-
-            state["countdown"] = (
-                state["entry_window"]
-            )
-
-            state["countdown_status"] = (
-                "ENTRY OPEN"
-            )
-
-        else:
-
-            state["signal_started"] = 0
-            state["signal_expires"] = 0
-            state["countdown"] = 0
-            state["countdown_status"] = (
-                "WAITING"
-            )
-
-        result_state = dict(state)
+    with STATE_LOCK:
+        result = dict(state)
 
     return jsonify({
         "ok": True,
         "message": "JSON feed accepted",
-        "state": result_state
+        "state": result
     })
 
 
 # ============================================================
-# API — SCREENSHOT / IMAGE FEED
+# IMAGE FRAME ENDPOINT
 # ============================================================
 
 @app.route("/api/frame", methods=["POST"])
 def api_frame():
 
-    if not token_valid(request):
-
+    if not check_token():
         return jsonify({
             "ok": False,
             "error": "Invalid feed token"
         }), 401
 
-    image_bytes = None
+    image_data = None
 
-    # Multipart file.
-    if "file" in request.files:
+    # Multipart upload.
+    if request.files:
 
-        image_bytes = (
-            request.files["file"].read()
-        )
+        for key in (
+            "frame",
+            "image",
+            "file",
+            "screenshot"
+        ):
 
-    elif "image" in request.files:
+            if key in request.files:
 
-        image_bytes = (
-            request.files["image"].read()
-        )
+                image_data = request.files[
+                    key
+                ].read()
 
-    # Raw image.
-    elif request.data:
+                break
 
-        image_bytes = request.data
+        if image_data is None:
 
-    if not image_bytes:
+            first = next(
+                iter(request.files.values()),
+                None
+            )
+
+            if first:
+                image_data = first.read()
+
+    # Raw JPEG/PNG body.
+    if image_data is None:
+
+        raw = request.get_data()
+
+        if raw:
+            image_data = raw
+
+    if not image_data:
 
         return jsonify({
             "ok": False,
@@ -958,257 +917,174 @@ def api_frame():
     try:
 
         image = Image.open(
-            io.BytesIO(image_bytes)
+            io.BytesIO(image_data)
         )
 
-        image.verify()
+        image.load()
 
-        # Re-open because verify() consumes the stream.
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        )
-
-        width, height = image.size
-
-    except Exception:
+    except Exception as exc:
 
         return jsonify({
             "ok": False,
-            "error": "Invalid image"
+            "error": "Invalid image",
+            "detail": str(exc)
         }), 400
 
-    current = now()
+    analysis = analyze_screen_image(
+        image
+    )
 
     with STATE_LOCK:
 
         state["image_received"] = True
-
-        state["last_frame"] = current
-
-        state["last_update"] = current
-
+        state["last_frame"] = now_ts()
         state["feed"] = "LIVE"
+        state["screen_status"] = "LIVE"
+        state["updated"] = iso_now()
 
-        state["screen"] = "LIVE"
+    # If an actual JSON price has already been supplied,
+    # don't replace it with an image-derived fake price.
+    with STATE_LOCK:
+        have_real_price = (
+            state["price"] > 0
+        )
 
-        # IMPORTANT:
-        # Do NOT reset asset, price, signal, confidence,
-        # entry, or candles when an image arrives.
+    if not have_real_price:
 
-        if state["analysis"] in (
-            "Waiting for usable market data.",
-            "Waiting for screen feed."
-        ):
+        observed = image_to_price_observation(
+            analysis
+        )
 
-            state["analysis"] = (
-                "Pocket Option screen received "
-                f"({width}x{height}). "
-                "Waiting for market-data feed."
-            )
+        if observed:
+            add_price(observed)
+
+    update_signal()
+
+    with STATE_LOCK:
+        result = dict(state)
 
     return jsonify({
         "ok": True,
         "message": "Screen frame accepted",
-        "width": width,
-        "height": height,
-        "image_received": True
+        "image_analysis": analysis,
+        "state": result
     })
 
 
 # ============================================================
-# SCREENSHOT ALIAS
+# STATE
 # ============================================================
 
-@app.route("/api/screenshot", methods=["POST"])
-def api_screenshot():
-    return api_frame()
-
-
-# ============================================================
-# API — SETTINGS
-# ============================================================
-
-@app.route("/api/settings", methods=["GET"])
-def get_settings():
+@app.route("/api/state", methods=["GET"])
+def api_state():
 
     with STATE_LOCK:
 
-        return jsonify({
-            "entry_window": state["entry_window"],
-            "timeframe": state["timeframe"],
-            "timeframes": list(
-                TIMEFRAMES.keys()
-            )
-        })
+        current = dict(state)
 
+        last = state["last_frame"]
 
-@app.route("/api/settings", methods=["POST"])
-def set_settings():
+        if last:
+            age = now_ts() - last
+        else:
+            age = 999999
 
-    data = request.get_json(silent=True)
+        if age > STALE_SECONDS:
 
-    if not isinstance(data, dict):
+            current["feed"] = "STALE"
+            current["screen_status"] = "DISCONNECTED"
+            current["signal"] = "WAIT"
+            current["confidence"] = 0
+            current["entry_window"] = 0
+            current["analysis_status"] = "WAITING FOR LIVE FEED"
 
-        return jsonify({
-            "ok": False,
-            "error": "Invalid JSON"
-        }), 400
+        else:
 
-    timeframe = str(
-        data.get(
-            "timeframe",
-            state["timeframe"]
+            current["feed"] = "LIVE"
+
+            started = state[
+                "signal_started"
+            ]
+
+            if (
+                state["signal"]
+                in ("CALL", "PUT")
+                and started > 0
+            ):
+
+                remaining = int(
+                    max(
+                        0,
+                        ENTRY_SECONDS
+                        - (
+                            now_ts()
+                            - started
+                        )
+                    )
+                )
+
+                current[
+                    "entry_window"
+                ] = remaining
+
+                if remaining <= 0:
+                    current["signal"] = "WAIT"
+                    current["analysis_status"] = (
+                        "ENTRY EXPIRED"
+                    )
+
+            else:
+
+                current["entry_window"] = 0
+
+        current["feed_age"] = round(
+            age,
+            2
         )
-    )
 
-    if timeframe not in TIMEFRAMES:
-
-        return jsonify({
-            "ok": False,
-            "error": "Invalid timeframe"
-        }), 400
-
-    with STATE_LOCK:
-
-        state["timeframe"] = timeframe
-
-    return jsonify({
-        "ok": True,
-        "timeframe": timeframe
-    })
+        return jsonify(current)
 
 
 # ============================================================
-# API — ASSETS
-# ============================================================
-
-@app.route("/api/assets", methods=["GET"])
-def api_assets():
-
-    return jsonify(ASSETS)
-
-
-@app.route("/api/assets/<path:category>", methods=["GET"])
-def api_asset_category(category):
-
-    if category not in ASSETS:
-
-        return jsonify({
-            "ok": False,
-            "error": "Unknown asset category"
-        }), 404
-
-    return jsonify({
-        "ok": True,
-        "category": category,
-        "assets": ASSETS[category]
-    })
-
-
-# ============================================================
-# API — HEALTH
+# HEALTH
 # ============================================================
 
 @app.route("/api/health", methods=["GET"])
 def health():
 
-    update_signal_timing()
-
-    return jsonify({
-        "ok": True,
-        "service": "ALUCARD V2.1",
-        "status": "online",
-        "feed_alive": feed_is_alive(),
-        "timestamp": (
-            datetime.now(timezone.utc).isoformat()
-        )
-    })
-
-
-# ============================================================
-# API — RESET
-# ============================================================
-
-@app.route("/api/reset", methods=["POST"])
-def reset_state():
-
     with STATE_LOCK:
 
-        old_timeframe = state.get(
-            "timeframe",
-            "1m"
+        age = (
+            now_ts() - state["last_frame"]
+            if state["last_frame"]
+            else 999999
         )
 
-        state.clear()
-
-        state.update({
-
-            "asset": "UNKNOWN",
-            "price": 0.0,
-
-            "signal": "WAIT",
-            "confidence": 0,
-
-            "entry": 0.0,
-            "entry_window": 12,
-
-            "countdown": 0,
-            "countdown_status": "WAITING",
-
-            "candles": 0,
-
-            "feed": "WAITING",
-            "screen": "WAITING",
-            "image_received": False,
-
-            "timeframe": old_timeframe,
-            "payout": 0,
-
-            "analysis": (
-                "Waiting for usable market data."
+        return jsonify({
+            "ok": True,
+            "service": "ALUCARD V2.1",
+            "feed": (
+                "LIVE"
+                if age <= STALE_SECONDS
+                else "STALE"
             ),
-
-            "last_update": 0,
-            "last_frame": 0,
-
-            "signal_started": 0,
-            "signal_expires": 0,
-
-            "ema9": 0.0,
-            "ema20": 0.0,
-            "ema50": 0.0,
-            "rsi": 0.0,
-            "macd": 0.0,
-            "macd_signal": 0.0,
-            "cci": 0.0,
-            "sar": 0.0,
-            "supertrend": 0.0,
-            "atr": 0.0,
-            "bollinger_upper": 0.0,
-            "bollinger_middle": 0.0,
-            "bollinger_lower": 0.0
+            "feed_age": round(age, 2),
+            "candles": len(prices),
+            "asset": state["asset"],
+            "signal": state["signal"],
         })
-
-    return jsonify({
-        "ok": True,
-        "message": "ALUCARD state reset"
-    })
 
 
 # ============================================================
-# DASHBOARD HTML
+# DASHBOARD
 # ============================================================
 
 HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-
+<!doctype html>
+<html>
 <head>
-
-<meta charset="UTF-8">
-
 <meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+      content="width=device-width,initial-scale=1">
 
 <title>ALUCARD V2.1</title>
 
@@ -1219,1652 +1095,680 @@ HTML = r"""
 }
 
 body {
-
     margin: 0;
-
     background:
-        radial-gradient(
-            circle at top,
-            #18351e 0%,
-            #07100a 45%,
-            #020403 100%
-        );
-
-    color: #d9ffe0;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-
-    min-height: 100vh;
+        radial-gradient(circle at top,#182719,#050805 65%);
+    color: #d9ffd9;
+    font-family: Arial, sans-serif;
 }
 
-.header {
-
-    padding:
-        18px
-        14px
-        10px;
-
-    text-align: center;
-
-    border-bottom:
-        1px solid #284d30;
+header {
+    padding: 18px;
+    border-bottom: 1px solid #2e642e;
+    background: rgba(0,0,0,.55);
 }
 
 .logo {
-
-    font-size: 30px;
-
+    font-size: 27px;
     font-weight: 900;
-
-    letter-spacing: 5px;
-
-    color: #d8ffdf;
-
-    text-shadow:
-        0 0 14px #39ff65;
+    letter-spacing: 4px;
 }
 
 .subtitle {
-
-    margin-top: 5px;
-
-    color: #78a981;
-
+    color: #79a879;
     font-size: 11px;
-
-    letter-spacing: 3px;
-}
-
-.feed-status {
-
-    display: inline-block;
-
-    margin-top: 12px;
-
-    padding:
-        7px
-        14px;
-
-    border:
-        1px solid #3d7a4b;
-
-    border-radius: 20px;
-
-    font-size: 12px;
-
-    letter-spacing: 1px;
-}
-
-.live {
-
-    color: #70ff8a;
-
-    box-shadow:
-        0 0 15px
-        rgba(60,255,100,.2);
-}
-
-.dead {
-    color: #ff6565;
-}
-
-.nav {
-
-    display: flex;
-
-    overflow-x: auto;
-
-    border-bottom:
-        1px solid #284d30;
-
-    background:
-        rgba(0,0,0,.35);
-}
-
-.nav button {
-
-    flex: 1;
-
-    min-width: 90px;
-
-    padding: 14px 8px;
-
-    background: transparent;
-
-    border: 0;
-
-    color: #7ea487;
-
-    font-weight: bold;
-}
-
-.nav button.active {
-
-    color: #8dff9f;
-
-    border-bottom:
-        2px solid #54ff73;
-}
-
-.page {
-
-    max-width: 1100px;
-
-    margin: auto;
-
-    padding: 14px;
-}
-
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(
-            2,
-            minmax(0, 1fr)
-        );
-
-    gap: 10px;
-}
-
-.card {
-
-    background:
-        rgba(8,20,11,.86);
-
-    border:
-        1px solid #23492c;
-
-    border-radius: 10px;
-
-    padding: 15px;
-
-    box-shadow:
-        inset
-        0 0 25px
-        rgba(60,255,100,.025);
-}
-
-.label {
-
-    color: #6e9878;
-
-    font-size: 10px;
-
     letter-spacing: 2px;
+    margin-top: 4px;
 }
 
-.value {
-
-    margin-top: 7px;
-
-    font-size: 21px;
-
-    font-weight: 800;
-
-    word-break: break-word;
+.status {
+    margin-top: 10px;
+    display: inline-block;
+    padding: 6px 10px;
+    border: 1px solid #397a39;
+    border-radius: 5px;
+    font-size: 11px;
 }
 
-.call {
-    color: #62ff7c;
+nav {
+    display: flex;
+    overflow-x: auto;
+    gap: 5px;
+    padding: 10px;
+    background: #071007;
 }
 
-.put {
-    color: #ff6262;
+nav button {
+    flex: 1;
+    min-width: 100px;
+    padding: 11px;
+    background: #0b160b;
+    border: 1px solid #284d28;
+    color: #9ac69a;
+    border-radius: 5px;
 }
 
-.wait {
-    color: #d9d9d9;
+main {
+    padding: 12px;
+    max-width: 1100px;
+    margin: auto;
 }
 
-.countdown {
-
-    font-size: 38px;
-
-    font-weight: 900;
-
-    color: #8dff9f;
-}
-
-.expired {
-    color: #ff5555;
-}
-
-.entry-open {
-    color: #6cff88;
-}
-
-.signal-panel {
-
-    margin-top: 12px;
-
-    padding: 20px;
-
-    text-align: center;
-
-    border:
-        1px solid #2d6338;
-
-    border-radius: 12px;
-
-    background:
-        linear-gradient(
-            135deg,
-            rgba(25,65,31,.8),
-            rgba(3,9,5,.9)
-        );
+.hero {
+    border: 1px solid #356635;
+    border-radius: 10px;
+    padding: 18px;
+    background: rgba(0,0,0,.45);
+    box-shadow: 0 0 25px rgba(0,0,0,.45);
 }
 
 .signal {
-
-    font-size: 42px;
-
+    text-align: center;
+    font-size: 54px;
     font-weight: 900;
+    letter-spacing: 5px;
+    margin: 8px 0;
+}
 
-    letter-spacing: 3px;
+.call {
+    color: #67ff67;
+    text-shadow: 0 0 18px #39ff39;
+}
+
+.put {
+    color: #ff5b5b;
+    text-shadow: 0 0 18px #ff2020;
+}
+
+.wait {
+    color: #c6c6c6;
 }
 
 .confidence {
+    text-align: center;
+    font-size: 18px;
+}
 
+.timer {
+    text-align: center;
+    font-size: 36px;
     margin-top: 8px;
-
-    font-size: 16px;
 }
 
-.select-wrap {
-    margin-top: 15px;
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit,minmax(145px,1fr));
+    gap: 9px;
+    margin-top: 12px;
 }
 
-select {
-
-    width: 100%;
-
-    padding: 13px;
-
-    background: #08130a;
-
-    color: #d9ffe0;
-
-    border:
-        1px solid #315c39;
-
+.card {
+    padding: 12px;
+    border: 1px solid #294d29;
     border-radius: 7px;
+    background: rgba(4,12,4,.8);
 }
 
-.category {
-    margin-top: 14px;
+.label {
+    font-size: 10px;
+    color: #729772;
+    letter-spacing: 1px;
 }
 
-.category-title {
+.value {
+    margin-top: 5px;
+    font-size: 17px;
+    font-weight: bold;
+}
 
-    margin-bottom: 7px;
+.section {
+    margin-top: 12px;
+    border: 1px solid #294d29;
+    border-radius: 8px;
+    padding: 13px;
+    background: rgba(0,0,0,.3);
+}
 
-    color: #8bb592;
-
-    font-size: 11px;
-
+.section h3 {
+    margin-top: 0;
+    font-size: 13px;
     letter-spacing: 2px;
 }
 
-.asset-list {
-
+.indicators {
     display: grid;
-
     grid-template-columns:
-        repeat(
-            2,
-            1fr
-        );
-
-    gap: 6px;
+        repeat(auto-fit,minmax(125px,1fr));
+    gap: 7px;
 }
 
-.asset {
-
-    padding: 9px;
-
-    background: #09160b;
-
-    border:
-        1px solid #1c3b23;
-
-    color: #b9d8bf;
-
-    border-radius: 5px;
-
-    font-size: 11px;
-
-    cursor: pointer;
-
-    transition: .15s;
-}
-
-.asset:hover {
-
-    border-color: #5aff76;
-
-    color: #7cff91;
-}
-
-.asset.selected {
-
-    border-color: #5aff76;
-
-    color: #7cff91;
-
-    box-shadow:
-        0 0 8px
-        rgba(90,255,118,.2);
+.ind {
+    border-bottom: 1px solid #203820;
+    padding: 7px;
 }
 
 .small {
-
     font-size: 11px;
-
-    color: #75947b;
-
-    line-height: 1.5;
-}
-
-.hidden {
-    display: none;
-}
-
-.asset-header {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    align-items: center;
-
-    gap: 10px;
-
-    margin-bottom: 12px;
-}
-
-.asset-search {
-
-    width: 100%;
-
-    padding: 12px;
-
-    background: #08130a;
-
-    color: #d9ffe0;
-
-    border:
-        1px solid #315c39;
-
-    border-radius: 7px;
-
-    outline: none;
-}
-
-.asset-search:focus {
-
-    border-color:
-        #5aff76;
-}
-
-@media (max-width: 600px) {
-
-    .grid {
-
-        grid-template-columns:
-            1fr 1fr;
-    }
-
-    .logo {
-
-        font-size: 25px;
-    }
-
-    .signal {
-
-        font-size: 35px;
-    }
+    color: #759075;
 }
 
 </style>
-
 </head>
 
 <body>
 
+<header>
 
-<div class="header">
+<div class="logo">ALUCARD</div>
 
-    <div class="logo">
-        ALUCARD
-    </div>
+<div class="subtitle">
+GOTHIC MARKET INTELLIGENCE — V2.1
+</div>
 
-    <div class="subtitle">
-        GOTHIC MARKET INTELLIGENCE — V2.1
-    </div>
+<div id="feedStatus"
+     class="status">
+FEED: WAITING
+</div>
 
-    <div id="feedStatus"
-         class="feed-status">
+</header>
 
-        FEED: WAITING
+<nav>
+<button>Signals</button>
+<button>Trades</button>
+<button>Performance</button>
+<button>Settings</button>
+</nav>
 
-    </div>
+<main>
+
+<div class="hero">
+
+<div class="label"
+     style="text-align:center">
+CURRENT SIGNAL
+</div>
+
+<div id="signal"
+     class="signal wait">
+WAIT
+</div>
+
+<div id="confidence"
+     class="confidence">
+Confidence: 0%
+</div>
+
+<div id="timer"
+     class="timer">
+--
+</div>
 
 </div>
 
+<div class="grid">
 
-<div class="nav">
+<div class="card">
+<div class="label">ASSET</div>
+<div id="asset"
+     class="value">
+UNKNOWN
+</div>
+</div>
 
-    <button
-        class="active"
-        onclick="showTab('signals', this)">
+<div class="card">
+<div class="label">PRICE</div>
+<div id="price"
+     class="value">
+0.000000
+</div>
+</div>
 
-        Signals
+<div class="card">
+<div class="label">ENTRY</div>
+<div id="entry"
+     class="value">
+0.000000
+</div>
+</div>
 
-    </button>
+<div class="card">
+<div class="label">CANDLES</div>
+<div id="candles"
+     class="value">
+0
+</div>
+</div>
 
-    <button
-        onclick="showTab('trades', this)">
+<div class="card">
+<div class="label">TIMEFRAME</div>
+<div id="timeframe"
+     class="value">
+30s
+</div>
+</div>
 
-        Trades
-
-    </button>
-
-    <button
-        onclick="showTab('performance', this)">
-
-        Performance
-
-    </button>
-
-    <button
-        onclick="showTab('settings', this)">
-
-        Settings
-
-    </button>
+<div class="card">
+<div class="label">PAYOUT</div>
+<div id="payout"
+     class="value">
+--
+</div>
+</div>
 
 </div>
 
-
-<div class="page">
-
-
-<!-- ======================================================
-     SIGNALS
-     ====================================================== -->
-
-<section id="signals">
-
-    <div class="signal-panel">
-
-        <div class="label">
-            CURRENT SIGNAL
-        </div>
-
-        <div id="signal"
-             class="signal wait">
-
-            WAIT
-
-        </div>
-
-        <div class="confidence">
-
-            Confidence:
-            <strong id="confidence">
-                0%
-            </strong>
-
-        </div>
-
-        <div style="margin-top:14px">
-
-            <div class="label">
-                ENTRY WINDOW
-            </div>
-
-            <div id="countdown"
-                 class="countdown">
-
-                --
-
-            </div>
-
-            <div id="countdownStatus"
-                 class="small">
-
-                WAITING
-
-            </div>
-
-        </div>
-
-    </div>
-
-
-    <div class="grid"
-         style="margin-top:12px">
-
-
-        <div class="card">
-
-            <div class="label">
-                ASSET
-            </div>
-
-            <div id="asset"
-                 class="value">
-
-                UNKNOWN
-
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                PRICE
-            </div>
-
-            <div id="price"
-                 class="value">
-
-                0.000000
-
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                ENTRY
-            </div>
-
-            <div id="entry"
-                 class="value">
-
-                0.000000
-
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                CANDLES
-            </div>
-
-            <div id="candles"
-                 class="value">
-
-                0
-
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                TIMEFRAME
-            </div>
-
-            <div id="timeframe"
-                 class="value">
-
-                1m
-
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="label">
-                PAYOUT
-            </div>
-
-            <div id="payout"
-                 class="value">
-
-                --
-
-            </div>
-
-        </div>
-
-    </div>
-
-
-    <div class="card"
-         style="margin-top:12px">
-
-        <div class="label">
-            SCREEN FEED
-        </div>
-
-        <div id="screen"
-             class="value">
-
-            WAITING
-
-        </div>
-
-        <p id="analysis"
-           class="small">
-
-            Waiting for usable market data.
-
-        </p>
-
-    </div>
-
-
-    <!-- CURRENCY MENU ALSO VISIBLE ON SIGNAL PAGE -->
-
-    <div class="card"
-         style="margin-top:12px">
-
-        <div class="asset-header">
-
-            <div class="label">
-                POCKET OPTION ASSETS
-            </div>
-
-        </div>
-
-        <input
-            id="assetSearchSignals"
-            class="asset-search"
-            type="search"
-            placeholder="Search currency, OTC, crypto, stock..."
-            oninput="filterAssets('assetSearchSignals','signalAssetMenu')">
-
-        <div id="signalAssetMenu"></div>
-
-    </div>
-
-</section>
-
-
-<!-- ======================================================
-     TRADES
-     ====================================================== -->
-
-<section id="trades"
-         class="hidden">
-
-    <div class="card">
-
-        <div class="label">
-            TRADE WINDOW
-        </div>
-
-        <h2>
-            Manual Trade Monitor
-        </h2>
-
-        <p class="small">
-
-            ALUCARD displays the incoming signal and
-            entry countdown. Confirm the market and
-            platform details yourself before placing
-            any trade.
-
-        </p>
-
-        <div class="grid">
-
-            <div>
-
-                <div class="label">
-                    SIGNAL
-                </div>
-
-                <div id="tradeSignal"
-                     class="value">
-
-                    WAIT
-
-                </div>
-
-            </div>
-
-            <div>
-
-                <div class="label">
-                    COUNTDOWN
-                </div>
-
-                <div id="tradeCountdown"
-                     class="value">
-
-                    --
-
-                </div>
-
-            </div>
-
-        </div>
-
-    </div>
-
-</section>
-
-
-<!-- ======================================================
-     PERFORMANCE
-     ====================================================== -->
-
-<section id="performance"
-         class="hidden">
-
-    <div class="card">
-
-        <div class="label">
-            PERFORMANCE
-        </div>
-
-        <h2>
-            Session Monitor
-        </h2>
-
-        <p class="small">
-
-            No historical win/loss statistics are fabricated.
-            This section reflects only data actually received
-            by the dashboard.
-
-        </p>
-
-        <div class="grid">
-
-            <div>
-
-                <div class="label">
-                    FEED
-                </div>
-
-                <div id="performanceFeed"
-                     class="value">
-
-                    WAITING
-
-                </div>
-
-            </div>
-
-            <div>
-
-                <div class="label">
-                    CANDLES
-                </div>
-
-                <div id="performanceCandles"
-                     class="value">
-
-                    0
-
-                </div>
-
-            </div>
-
-        </div>
-
-    </div>
-
-</section>
-
-
-<!-- ======================================================
-     SETTINGS
-     ====================================================== -->
-
-<section id="settings"
-         class="hidden">
-
-
-    <div class="card">
-
-        <div class="label">
-            TIMEFRAME
-        </div>
-
-        <div class="select-wrap">
-
-            <select
-                id="timeframeSelect"
-                onchange="changeTimeframe()">
-
-                <option value="5s">
-                    5 seconds
-                </option>
-
-                <option value="15s">
-                    15 seconds
-                </option>
-
-                <option value="30s">
-                    30 seconds
-                </option>
-
-                <option value="1m">
-                    1 minute
-                </option>
-
-                <option value="2m">
-                    2 minutes
-                </option>
-
-                <option value="3m">
-                    3 minutes
-                </option>
-
-                <option value="5m">
-                    5 minutes
-                </option>
-
-                <option value="15m">
-                    15 minutes
-                </option>
-
-                <option value="30m">
-                    30 minutes
-                </option>
-
-                <option value="1h">
-                    1 hour
-                </option>
-
-                <option value="4h">
-                    4 hours
-                </option>
-
-                <option value="1d">
-                    1 day
-                </option>
-
-            </select>
-
-        </div>
-
-    </div>
-
-
-    <div class="card"
-         style="margin-top:12px">
-
-        <div class="label">
-            POCKET OPTION ASSETS
-        </div>
-
-        <input
-            id="assetSearchSettings"
-            class="asset-search"
-            type="search"
-            placeholder="Search assets..."
-            oninput="filterAssets('assetSearchSettings','assetMenu')">
-
-        <div id="assetMenu"></div>
-
-    </div>
-
-</section>
-
+<div class="section">
+
+<h3>MARKET ANALYSIS</h3>
+
+<div id="analysisStatus"
+     class="small">
+Waiting for live feed...
+</div>
+
+<div class="indicators">
+
+<div class="ind">
+<div class="label">EMA 9</div>
+<div id="ema9">--</div>
+</div>
+
+<div class="ind">
+<div class="label">EMA 20</div>
+<div id="ema20">--</div>
+</div>
+
+<div class="ind">
+<div class="label">EMA 50</div>
+<div id="ema50">--</div>
+</div>
+
+<div class="ind">
+<div class="label">RSI</div>
+<div id="rsi">--</div>
+</div>
+
+<div class="ind">
+<div class="label">MACD</div>
+<div id="macd">--</div>
+</div>
+
+<div class="ind">
+<div class="label">CCI</div>
+<div id="cci">--</div>
+</div>
+
+<div class="ind">
+<div class="label">SAR</div>
+<div id="sar">--</div>
+</div>
+
+<div class="ind">
+<div class="label">ATR</div>
+<div id="atr">--</div>
+</div>
+
+<div class="ind">
+<div class="label">BOLLINGER</div>
+<div id="bb">--</div>
+</div>
 
 </div>
 
+</div>
+
+<div class="section">
+
+<h3>SCREEN FEED</h3>
+
+<div class="grid">
+
+<div class="card">
+<div class="label">SCREEN</div>
+<div id="screen"
+     class="value">
+WAITING
+</div>
+</div>
+
+<div class="card">
+<div class="label">FEED AGE</div>
+<div id="age"
+     class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="label">BULL SCORE</div>
+<div id="bull"
+     class="value">
+0
+</div>
+</div>
+
+<div class="card">
+<div class="label">BEAR SCORE</div>
+<div id="bear"
+     class="value">
+0
+</div>
+</div>
+
+</div>
+
+</div>
+
+</main>
 
 <script>
 
-let currentState = {};
+function setText(id,value) {
 
-let selectedAsset = "";
+    const el =
+        document.getElementById(id);
 
-
-/* ========================================================
-   TAB CONTROL
-   ======================================================== */
-
-function showTab(tab, button) {
-
-    const sections = [
-        "signals",
-        "trades",
-        "performance",
-        "settings"
-    ];
-
-    sections.forEach(id => {
-
-        document
-            .getElementById(id)
-            .classList
-            .toggle(
-                "hidden",
-                id !== tab
-            );
-
-    });
-
-    document
-        .querySelectorAll(".nav button")
-        .forEach(btn => {
-
-            btn.classList.remove("active");
-
-        });
-
-    button.classList.add("active");
+    if (el) {
+        el.textContent = value;
+    }
 }
 
 
-/* ========================================================
-   SIGNAL COLOR
-   ======================================================== */
-
-function signalClass(signal) {
-
-    if (signal === "CALL")
-        return "call";
-
-    if (signal === "PUT")
-        return "put";
-
-    return "wait";
-}
-
-
-/* ========================================================
-   FORMAT ASSET
-   ======================================================== */
-
-function displayAsset(asset) {
-
-    if (!asset)
-        return "UNKNOWN";
-
-    return asset;
-}
-
-
-/* ========================================================
-   UPDATE UI
-   ======================================================== */
-
-function updateUI(data) {
-
-    currentState = data || {};
-
-    const signal =
-        data.signal || "WAIT";
-
-    const confidence =
-        Number(
-            data.confidence || 0
-        );
-
-
-    document
-        .getElementById("asset")
-        .textContent =
-            displayAsset(
-                selectedAsset ||
-                data.asset
-            );
-
-
-    document
-        .getElementById("price")
-        .textContent =
-            Number(
-                data.price || 0
-            ).toFixed(6);
-
-
-    document
-        .getElementById("entry")
-        .textContent =
-            Number(
-                data.entry || 0
-            ).toFixed(6);
-
-
-    document
-        .getElementById("candles")
-        .textContent =
-            data.candles || 0;
-
-
-    document
-        .getElementById("timeframe")
-        .textContent =
-            data.timeframe || "1m";
-
-
-    document
-        .getElementById("confidence")
-        .textContent =
-            confidence + "%";
-
-
-    document
-        .getElementById("payout")
-        .textContent =
-            Number(data.payout || 0) > 0
-                ? data.payout + "%"
-                : "--";
-
-
-    document
-        .getElementById("analysis")
-        .textContent =
-            data.analysis ||
-            "Waiting for usable market data.";
-
-
-    document
-        .getElementById("screen")
-        .textContent =
-            data.screen || "WAITING";
-
-
-    const signalElement =
-        document.getElementById(
-            "signal"
-        );
-
-
-    signalElement.textContent =
-        signal;
-
-
-    signalElement.className =
-        "signal " +
-        signalClass(signal);
-
-
-    let countdown =
-        Number(
-            data.countdown || 0
-        );
-
-
-    const countdownElement =
-        document.getElementById(
-            "countdown"
-        );
-
-
-    const countdownStatus =
-        document.getElementById(
-            "countdownStatus"
-        );
-
-
-    countdownElement.textContent =
-        countdown > 0
-            ? countdown + "s"
-            : "--";
-
-
-    countdownStatus.textContent =
-        data.countdown_status ||
-        "WAITING";
-
+function number(value,digits=5) {
 
     if (
-        data.countdown_status ===
-        "EXPIRED"
+        value === undefined ||
+        value === null ||
+        value === 0
     ) {
-
-        countdownElement.className =
-            "countdown expired";
-
-    } else {
-
-        countdownElement.className =
-            "countdown " +
-            (
-                countdown > 0
-                    ? "entry-open"
-                    : "expired"
-            );
+        return "--";
     }
 
+    const n = Number(value);
 
-    document
-        .getElementById("tradeSignal")
-        .textContent =
-            signal;
-
-
-    document
-        .getElementById("tradeCountdown")
-        .textContent =
-            countdown > 0
-                ? countdown + "s"
-                : (
-                    data.countdown_status ===
-                    "WAITING"
-                        ? "--"
-                        : "EXPIRED"
-                );
-
-
-    document
-        .getElementById("performanceFeed")
-        .textContent =
-            data.feed || "WAITING";
-
-
-    document
-        .getElementById("performanceCandles")
-        .textContent =
-            data.candles || 0;
-
-
-    const feedStatus =
-        document.getElementById(
-            "feedStatus"
-        );
-
-
-    if (data.feed_alive) {
-
-        feedStatus.textContent =
-            "FEED: LIVE";
-
-        feedStatus.className =
-            "feed-status live";
-
-    } else {
-
-        feedStatus.textContent =
-            "FEED: " +
-            (
-                data.feed ||
-                "WAITING"
-            );
-
-        feedStatus.className =
-            "feed-status dead";
+    if (!Number.isFinite(n)) {
+        return "--";
     }
 
-
-    const select =
-        document.getElementById(
-            "timeframeSelect"
-        );
-
-
-    if (
-        data.timeframe &&
-        select.value !== data.timeframe
-    ) {
-
-        select.value =
-            data.timeframe;
-    }
-
-
-    highlightSelectedAsset();
+    return n.toFixed(digits);
 }
 
 
-/* ========================================================
-   LOAD STATE
-   ======================================================== */
-
-async function loadState() {
+async function update() {
 
     try {
 
         const response =
             await fetch(
                 "/api/state",
-                {
-                    cache: "no-store"
-                }
+                {cache:"no-store"}
             );
 
-
-        if (!response.ok)
-            throw new Error(
-                "State request failed"
-            );
-
-
-        const data =
+        const s =
             await response.json();
 
+        const signal =
+            s.signal || "WAIT";
 
-        updateUI(data);
-
-
-    } catch (error) {
-
-        const status =
+        const signalEl =
             document.getElementById(
-                "feedStatus"
+                "signal"
             );
 
+        signalEl.textContent =
+            signal;
 
-        status.textContent =
-            "FEED: ERROR";
-
-        status.className =
-            "feed-status dead";
-    }
-}
-
-
-/* ========================================================
-   BUILD ASSET MENU
-   ======================================================== */
-
-function buildAssetMenu(
-    targetId
-) {
-
-    fetch("/api/assets", {
-        cache: "no-store"
-    })
-
-    .then(response => {
-
-        if (!response.ok)
-            throw new Error(
-                "Asset request failed"
+        signalEl.className =
+            "signal " +
+            (
+                signal === "CALL"
+                    ? "call"
+                    : signal === "PUT"
+                        ? "put"
+                        : "wait"
             );
 
-        return response.json();
-
-    })
-
-    .then(assets => {
-
-        const menu =
-            document.getElementById(
-                targetId
-            );
-
-
-        if (!menu)
-            return;
-
-
-        menu.innerHTML = "";
-
-
-        Object.keys(assets)
-            .forEach(category => {
-
-                const wrapper =
-                    document.createElement(
-                        "div"
-                    );
-
-                wrapper.className =
-                    "category";
-
-
-                const title =
-                    document.createElement(
-                        "div"
-                    );
-
-                title.className =
-                    "category-title";
-
-                title.textContent =
-                    category;
-
-
-                wrapper.appendChild(
-                    title
-                );
-
-
-                const list =
-                    document.createElement(
-                        "div"
-                    );
-
-                list.className =
-                    "asset-list";
-
-
-                assets[category]
-                    .forEach(asset => {
-
-                        const item =
-                            document
-                                .createElement(
-                                    "div"
-                                );
-
-
-                        item.className =
-                            "asset";
-
-
-                        item.textContent =
-                            asset;
-
-
-                        item.dataset.asset =
-                            asset.toLowerCase();
-
-
-                        item.onclick =
-                            function() {
-
-                                selectAsset(
-                                    asset
-                                );
-
-                            };
-
-
-                        list.appendChild(
-                            item
-                        );
-
-                    });
-
-
-                wrapper.appendChild(
-                    list
-                );
-
-                menu.appendChild(
-                    wrapper
-                );
-
-            });
-
-
-        highlightSelectedAsset();
-
-    })
-
-    .catch(error => {
-
-        console.log(
-            "Asset menu error:",
-            error
+        setText(
+            "confidence",
+            "Confidence: " +
+            (s.confidence || 0) +
+            "%"
         );
 
-        const menu =
-            document.getElementById(
-                targetId
+        setText(
+            "asset",
+            s.asset || "UNKNOWN"
+        );
+
+        setText(
+            "price",
+            number(s.price,6)
+        );
+
+        setText(
+            "entry",
+            number(s.entry,6)
+        );
+
+        setText(
+            "candles",
+            s.candles || 0
+        );
+
+        setText(
+            "timeframe",
+            s.timeframe || "30s"
+        );
+
+        setText(
+            "payout",
+            s.payout || "--"
+        );
+
+        setText(
+            "screen",
+            s.screen_status || "WAITING"
+        );
+
+        setText(
+            "age",
+            s.feed_age !== undefined
+                ? s.feed_age + "s"
+                : "--"
+        );
+
+        setText(
+            "bull",
+            s.bull_score || 0
+        );
+
+        setText(
+            "bear",
+            s.bear_score || 0
+        );
+
+        setText(
+            "analysisStatus",
+            s.analysis_status ||
+            "Analyzing..."
+        );
+
+        const timer =
+            Number(
+                s.entry_window || 0
             );
 
-        if (menu) {
+        setText(
+            "timer",
+            (
+                signal === "CALL" ||
+                signal === "PUT"
+            )
+                ? timer + "s"
+                : "--"
+        );
 
-            menu.innerHTML =
-                '<div class="small">' +
-                'Unable to load asset menu.' +
-                '</div>';
+        setText(
+            "feedStatus",
+            "FEED: " +
+            (s.feed || "WAITING")
+        );
 
+        setText(
+            "ema9",
+            number(s.ema9)
+        );
+
+        setText(
+            "ema20",
+            number(s.ema20)
+        );
+
+        setText(
+            "ema50",
+            number(s.ema50)
+        );
+
+        setText(
+            "rsi",
+            number(s.rsi,2)
+        );
+
+        setText(
+            "macd",
+            number(s.macd,6)
+        );
+
+        setText(
+            "cci",
+            number(s.cci,2)
+        );
+
+        setText(
+            "sar",
+            number(s.sar)
+        );
+
+        setText(
+            "atr",
+            number(s.atr,6)
+        );
+
+        if (
+            s.bb_upper &&
+            s.bb_lower
+        ) {
+
+            setText(
+                "bb",
+                number(s.bb_lower) +
+                " / " +
+                number(s.bb_upper)
+            );
+
+        } else {
+
+            setText(
+                "bb",
+                "--"
+            );
         }
 
-    });
-}
+    } catch(error) {
 
-
-/* ========================================================
-   SELECT ASSET
-   ======================================================== */
-
-function selectAsset(asset) {
-
-    selectedAsset = asset;
-
-
-    document
-        .getElementById("asset")
-        .textContent =
-            asset;
-
-
-    highlightSelectedAsset();
-}
-
-
-/* ========================================================
-   HIGHLIGHT SELECTED ASSET
-   ======================================================== */
-
-function highlightSelectedAsset() {
-
-    document
-        .querySelectorAll(".asset")
-        .forEach(item => {
-
-            if (
-                selectedAsset &&
-                item.textContent ===
-                selectedAsset
-            ) {
-
-                item.classList.add(
-                    "selected"
-                );
-
-            } else {
-
-                item.classList.remove(
-                    "selected"
-                );
-
-            }
-
-        });
-}
-
-
-/* ========================================================
-   ASSET SEARCH
-   ======================================================== */
-
-function filterAssets(
-    searchId,
-    menuId
-) {
-
-    const search =
-        document.getElementById(
-            searchId
+        setText(
+            "feedStatus",
+            "FEED: OFFLINE"
         );
 
-
-    const query =
-        (
-            search.value || ""
-        )
-        .toLowerCase()
-        .trim();
-
-
-    const menu =
-        document.getElementById(
-            menuId
+        setText(
+            "analysisStatus",
+            "Dashboard cannot reach feed"
         );
-
-
-    if (!menu)
-        return;
-
-
-    menu
-        .querySelectorAll(".asset")
-        .forEach(item => {
-
-            const name =
-                item.dataset.asset ||
-                item.textContent
-                    .toLowerCase();
-
-
-            item.style.display =
-                !query ||
-                name.includes(query)
-                    ? ""
-                    : "none";
-
-        });
-
-
-    menu
-        .querySelectorAll(".category")
-        .forEach(category => {
-
-            const visible =
-                Array.from(
-                    category.querySelectorAll(
-                        ".asset"
-                    )
-                )
-                .some(
-                    item =>
-                        item.style.display !==
-                        "none"
-                );
-
-
-            category.style.display =
-                visible
-                    ? ""
-                    : "none";
-
-        });
-}
-
-
-/* ========================================================
-   CHANGE TIMEFRAME
-   ======================================================== */
-
-async function changeTimeframe() {
-
-    const timeframe =
-        document
-            .getElementById(
-                "timeframeSelect"
-            )
-            .value;
-
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/settings",
-                {
-
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body: JSON.stringify({
-                        timeframe:
-                            timeframe
-                    })
-
-                }
-            );
-
-
-        if (!response.ok)
-            throw new Error(
-                "Settings update failed"
-            );
-
-
-        await loadState();
-
-
-    } catch (error) {
-
-        console.log(error);
-
     }
 }
 
 
-/* ========================================================
-   INITIALIZATION
-   ======================================================== */
-
-buildAssetMenu(
-    "assetMenu"
-);
-
-buildAssetMenu(
-    "signalAssetMenu"
-);
-
-loadState();
-
-
-/* ========================================================
-   LIVE STATE REFRESH
-   ======================================================== */
+update();
 
 setInterval(
-    loadState,
+    update,
     1000
 );
 
 </script>
 
 </body>
-
 </html>
 """
 
 
-# ============================================================
-# MAIN DASHBOARD ROUTE
-# ============================================================
-
 @app.route("/", methods=["GET"])
 def dashboard():
-
     return render_template_string(
         HTML
     )
 
 
 # ============================================================
-# STARTUP
+# BACKGROUND STALE-FEED WATCHDOG
+# ============================================================
+
+def watchdog():
+
+    while True:
+
+        try:
+
+            with STATE_LOCK:
+
+                if state["last_frame"]:
+
+                    age = (
+                        now_ts()
+                        - state["last_frame"]
+                    )
+
+                    if age > STALE_SECONDS:
+
+                        state["feed"] = "STALE"
+                        state["screen_status"] = (
+                            "DISCONNECTED"
+                        )
+
+                        state["signal"] = "WAIT"
+                        state["confidence"] = 0
+                        state["entry"] = 0.0
+                        state["entry_window"] = 0
+                        state["signal_started"] = 0
+
+                        state["analysis_status"] = (
+                            "WAITING FOR LIVE FEED"
+                        )
+
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+
+watchdog_thread = threading.Thread(
+    target=watchdog,
+    daemon=True
+)
+
+watchdog_thread.start()
+
+
+# ============================================================
+# LOCAL START
 # ============================================================
 
 if __name__ == "__main__":
 
     port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
+        os.getenv("PORT", "5000")
     )
 
     app.run(
