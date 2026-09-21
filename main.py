@@ -38,7 +38,7 @@ state = {
  "asset":"EURUSD_otc","timeframe":"1m","signal":"WAIT","confidence":0,
  "price":None,"entry":None,"entry_window":0,"feed":"DISCONNECTED","engine":"WAITING_FOR_FEED",
  "frames":0,"analyses":0,"last_frame":None,"last_analysis":None,"image_received":False,
- "width":0,"height":0,"reason":"Waiting for a fresh screen frame","indicators":{},"last_error":None
+ "width":0,"height":0,"reason":"Waiting for a fresh screen frame","indicators":{},"payout":None,"otc_verified":True,"strategy":"MTF_CONFLUENCE","last_error":None
 }
 lock = threading.RLock()
 history = deque(maxlen=100)
@@ -166,45 +166,157 @@ def visual_series(arr):
     return p,green,red
 
 # ----------------------------- engine --------------------------------------
+def wma(x,n):
+    x=np.asarray(x,float)
+    if len(x)<n: return float(x[-1]) if len(x) else 0.0
+    w=np.arange(1,n+1,dtype=float); return float(np.dot(x[-n:],w)/w.sum())
+
+def stoch(x,n=14):
+    x=np.asarray(x,float)
+    if len(x)<n: return 50.0
+    lo=float(np.min(x[-n:])); hi=float(np.max(x[-n:]))
+    return 50.0 if hi==lo else float((x[-1]-lo)/(hi-lo)*100)
+
+def adx_proxy(x,n=14):
+    x=np.asarray(x,float)
+    if len(x)<n+2:return 0.0
+    d=np.diff(x); tr=np.abs(d[-n:])+1e-9
+    return float(abs(np.mean(d[-n:]))/np.mean(tr)*100)
+
+def make_candles(series, bucket):
+    s=np.asarray(series,float)
+    bucket=max(2,int(bucket))
+    n=len(s)//bucket
+    if n<5:return None
+    s=s[-n*bucket:]
+    o=s[::bucket]; c=s[bucket-1::bucket]
+    h=np.array([np.max(s[i:i+bucket]) for i in range(0,len(s),bucket)])
+    l=np.array([np.min(s[i:i+bucket]) for i in range(0,len(s),bucket)])
+    return o,h,l,c
+
+def candle_features(series,bucket):
+    q=make_candles(series,bucket)
+    if q is None:return None
+    o,h,l,c=q
+    return {"open":o,"high":h,"low":l,"close":c,
+            "ema9":ema(c,9)[-1],"ema20":ema(c,20)[-1],"ema50":ema(c,50)[-1],
+            "rsi":rsi(c),"macd":macd(c)[0],"macd_signal":macd(c)[1],"macd_hist":macd(c)[2],
+            "cci":cci(c),"atr":atr(c),"slope":slope(c),"stoch":stoch(c),"adx":adx_proxy(c),
+            "wma":wma(c,10),"last":c[-1],"body":float(c[-1]-o[-1]),
+            "range":float(h[-1]-l[-1])+1e-9}
+
 def analyze(arr, metadata=None):
+    """Screen-feed engine.
+
+    The public SignalBots pages describe trend + momentum + volatility, multiple
+    timeframes, payout filtering and broker/asset-specific reads. They do not
+    disclose proprietary weights. This implementation therefore uses the same
+    publicly described categories without pretending to reproduce their private
+    model.
+    """
     global last_gray,last_frame_arr
+    metadata=metadata or {}
     s,green,red=visual_series(arr)
-    if len(s)<30: raise ValueError("not enough visible chart structure")
-    e9,e20,e50=ema(s,9)[-1],ema(s,20)[-1],ema(s,50)[-1]
-    mm,ms,mh=macd(s); rv=rsi(s); cc=cci(s); bl,bm,bu=bb(s); at=atr(s); sl=slope(s)
-    jaw,teeth,lips=ema(s,13)[-1],ema(s,8)[-1],ema(s,5)[-1]
-    bull=bear=0.0; reasons=[]; checks=[]
-    def check(name,side,weight):
+    if len(s)<60: raise ValueError("not enough visible chart structure")
+
+    # A screenshot is normalized, so its series is used for direction/structure,
+    # while any broker price supplied by bridge.py remains the displayed price.
+    tf=str(metadata.get("timeframe") or metadata.get("tf") or state.get("timeframe") or "1m")
+    seconds=int(TIMEFRAMES.get(tf,60))
+    base=max(2,round(seconds/5))
+    # A phone screenshot contains a finite number of visible points. Cap the
+    # bucket so longer selected timeframes degrade to a stable visual sample
+    # instead of throwing a 500 error. The selected timeframe remains explicit
+    # in the state and is still used for the entry/countdown configuration.
+    base=min(base,max(2,len(s)//6))
+    # Three structural views: selected TF, one faster confirmation and one slower filter.
+    fast=max(2,base//2); mid=max(2,base); slow=max(2,base*2)
+    views=[]
+    for name,b in (("fast",fast),("selected",mid),("slow",slow)):
+        f=candle_features(s,b)
+        if f is not None: views.append((name,f))
+    if not views:
+        raise ValueError("not enough candles reconstructed from chart")
+
+    bull=bear=0.0; checks=[]
+    def add(name, side, weight, detail=""):
         nonlocal bull,bear
-        if side=="bull":bull+=weight; val="BULLISH"
-        elif side=="bear":bear+=weight; val="BEARISH"
-        else:val="NEUTRAL"
-        checks.append({"name":name,"value":val,"weight":weight})
-    check("EMA 9/20","bull" if e9>e20 else "bear" if e9<e20 else "neutral",1.4)
-    check("EMA 20/50","bull" if e20>e50 else "bear" if e20<e50 else "neutral",1.2)
-    check("MACD","bull" if mh>0 else "bear" if mh<0 else "neutral",1.25)
-    check("RSI","bull" if 52<=rv<=72 else "bear" if 28<=rv<=48 else "neutral",1.0)
-    check("CCI","bull" if cc>50 else "bear" if cc<-50 else "neutral",.85)
-    check("Alligator","bull" if lips>teeth>jaw else "bear" if lips<teeth<jaw else "neutral",1.1)
-    check("Parabolic SAR proxy","bull" if e9>e20 and sl>0 else "bear" if e9<e20 and sl<0 else "neutral",.75)
-    check("Supertrend proxy","bull" if sl>.035 else "bear" if sl<-.035 else "neutral",1.0)
-    if bm is not None: check("Bollinger","bull" if s[-1]>bm else "bear" if s[-1]<bm else "neutral",.75)
-    else: check("Bollinger","neutral",.75)
-    check("Momentum","bull" if s[-1]>s[-3] else "bear" if s[-1]<s[-3] else "neutral",.8)
-    check("Candle color","bull" if green>red*1.18 else "bear" if red>green*1.18 else "neutral",.45)
-    total=bull+bear; edge=abs(bull-bear)/(total+1e-9); conf=50+48*edge
-    signal="CALL" if bull>bear and bull>=5.7 else "PUT" if bear>bull and bear>=5.7 else "WAIT"
-    if min(bull,bear)/(max(bull,bear)+1e-9)>.75: signal="WAIT"
-    if np.std(s)<.18: signal="WAIT";conf=min(conf,54)
-    if signal=="WAIT":conf=min(conf,59)
-    # A visual image has no broker price scale. Only use a supplied bridge price.
-    price=None if not metadata else metadata.get("price")
+        if side=="bull": bull+=weight; val="BULLISH"
+        elif side=="bear": bear+=weight; val="BEARISH"
+        else: val="NEUTRAL"
+        checks.append({"name":name,"value":val,"weight":weight,"detail":detail})
+
+    selected=next((f for n,f in views if n=="selected"),views[-1][1])
+    for name,f in views:
+        tag=name.upper()
+        add(f"{tag} EMA 9/20","bull" if f["ema9"]>f["ema20"] else "bear" if f["ema9"]<f["ema20"] else "neutral",1.15 if name=="selected" else .65)
+        add(f"{tag} EMA 20/50","bull" if f["ema20"]>f["ema50"] else "bear" if f["ema20"]<f["ema50"] else "neutral",1.0 if name=="selected" else .55)
+        add(f"{tag} MACD","bull" if f["macd_hist"]>0 else "bear" if f["macd_hist"]<0 else "neutral",1.05 if name=="selected" else .5)
+        add(f"{tag} RSI","bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",.85 if name=="selected" else .4)
+        add(f"{tag} CCI","bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",.7 if name=="selected" else .35)
+        add(f"{tag} Momentum","bull" if f["last"]>f["wma"] and f["body"]>0 else "bear" if f["last"]<f["wma"] and f["body"]<0 else "neutral",.8 if name=="selected" else .4)
+        add(f"{tag} Trend slope","bull" if f["slope"]>0 else "bear" if f["slope"]<0 else "neutral",.75 if name=="selected" else .35)
+
+    # Alligator-style structure on the selected reconstructed closes.
+    c=selected["close"]
+    jaw=ema(c,13)[-1]; teeth=ema(c,8)[-1]; lips=ema(c,5)[-1]
+    add("Alligator","bull" if lips>teeth>jaw else "bear" if lips<teeth<jaw else "neutral",1.0)
+    add("Parabolic SAR proxy","bull" if selected["ema9"]>selected["ema20"] and selected["slope"]>0 else "bear" if selected["ema9"]<selected["ema20"] and selected["slope"]<0 else "neutral",.7)
+    add("Bollinger","bull" if selected["last"]>np.mean(c[-min(20,len(c)):]) else "bear" if selected["last"]<np.mean(c[-min(20,len(c)):]) else "neutral",.65)
+    add("Stochastic","bull" if selected["stoch"]>55 and selected["stoch"]<90 else "bear" if selected["stoch"]<45 and selected["stoch"]>10 else "neutral",.55)
+    add("ADX / trend strength","neutral" if selected["adx"]<15 else ("bull" if bull>bear else "bear" if bear>bull else "neutral"),.55, f"{selected['adx']:.1f}")
+    add("Screen candle color","bull" if green>red*1.15 else "bear" if red>green*1.15 else "neutral",.45)
+
+    # Volatility guard: extremely compressed or wildly unstable images are WAIT.
+    vol=float(selected["atr"])
+    dispersion=float(np.std(c[-min(30,len(c)):]))
+    compression=dispersion < .12
+    if compression:
+        checks.append({"name":"Volatility guard","value":"BLOCKED","weight":0,"detail":"chart compression"})
+
+    total=bull+bear
+    edge=abs(bull-bear)/(total+1e-9)
+    conf=50+48*edge
+    signal="CALL" if bull>bear else "PUT" if bear>bull else "WAIT"
+
+    # Require confluence rather than a single indicator. This deliberately favors WAIT.
+    dominance=max(bull,bear)/(total+1e-9)
+    if dominance<0.62 or total<6.0 or compression:
+        signal="WAIT"
+    if signal=="WAIT": conf=min(conf,59)
+
+    asset=str(metadata.get("asset") or state.get("asset") or "EURUSD_otc")
+    payout=metadata.get("payout")
+    try:payout=float(payout) if payout is not None else None
+    except Exception:payout=None
+    payout_floor=float(os.getenv("MIN_PAYOUT","78"))
+    payout_ok=payout is None or payout>=payout_floor
+    if not payout_ok:
+        signal="WAIT"; conf=min(conf,59)
+
+    otc=asset.lower().endswith("_otc")
+    price=metadata.get("price")
     try:price=float(price) if price is not None else None
     except Exception:price=None
-    indicators={"ema9":round(float(e9),4),"ema20":round(float(e20),4),"ema50":round(float(e50),4),"rsi":round(rv,2),"macd":round(mm,4),"macd_signal":round(ms,4),"macd_hist":round(mh,4),"cci":round(cc,2),"atr":round(at,4),"slope":round(sl,4),"alligator":"BULL" if lips>teeth>jaw else "BEAR" if lips<teeth<jaw else "MIXED","bull_pixels":round(green,4),"bear_pixels":round(red,4),"checks":checks}
-    reason=f"{round(bull,1)} bullish / {round(bear,1)} bearish confirmations"
-    if signal=="WAIT":reason += " • directional confluence not strong enough"
-    return {"signal":signal,"confidence":round(float(min(99,max(0,conf))),1),"reason":reason,"price":price,"indicators":indicators}
+
+    indicators={
+      "mode":"OTC" if otc else "LIVE",
+      "asset":asset,"timeframe":tf,"payout":payout,"payout_floor":payout_floor,
+      "candle_count":int(len(selected["close"])),"multi_timeframe": [n for n,_ in views],
+      "ema9":round(float(selected["ema9"]),5),"ema20":round(float(selected["ema20"]),5),"ema50":round(float(selected["ema50"]),5),
+      "rsi":round(float(selected["rsi"]),2),"macd":round(float(selected["macd"]),5),"macd_signal":round(float(selected["macd_signal"]),5),"macd_hist":round(float(selected["macd_hist"]),5),
+      "cci":round(float(selected["cci"]),2),"atr":round(float(selected["atr"]),5),"slope":round(float(selected["slope"]),5),
+      "stoch":round(float(selected["stoch"]),2),"adx":round(float(selected["adx"]),2),
+      "alligator":"BULL" if lips>teeth>jaw else "BEAR" if lips<teeth<jaw else "MIXED",
+      "bull_pixels":round(green,4),"bear_pixels":round(red,4),"bull_score":round(bull,2),"bear_score":round(bear,2),
+      "checks":checks
+    }
+    reasons=[f"{bull:.1f} bullish / {bear:.1f} bearish",f"MTF: {','.join(n for n,_ in views)}"]
+    if otc: reasons.append("OTC asset mode")
+    if payout is not None and not payout_ok: reasons.append(f"payout {payout:.0f}% below {payout_floor:.0f}% floor")
+    if compression: reasons.append("low volatility")
+    if signal=="WAIT": reasons.append("confluence gate not met")
+    return {"signal":signal,"confidence":round(float(min(99,max(0,conf))),1),"reason":" • ".join(reasons),"price":price,"indicators":indicators}
 
 # ----------------------------- API -----------------------------------------
 @app.get("/")
@@ -232,6 +344,9 @@ def config():
     with lock:
         if d.get("asset") in ALL_ASSETS:state["asset"]=d["asset"]
         if d.get("timeframe") in TIMEFRAMES:state["timeframe"]=d["timeframe"]
+        if d.get("payout") is not None:
+            try: state["payout"]=float(d["payout"])
+            except Exception: pass
     return jsonify(ok=True,asset=state["asset"],timeframe=state["timeframe"])
 @app.post("/api/frame")
 def frame():
@@ -242,14 +357,14 @@ def frame():
     metadata={}
     if request.is_json:metadata=request.get_json(silent=True) or {}
     else:
-        for k in ("asset","price","timeframe","tf"):
+        for k in ("asset","price","timeframe","tf","payout"):
             if request.form.get(k) is not None:metadata[k]=request.form.get(k)
     try:
         result=analyze(arr,metadata)
         with lock:
             state["frames"]+=1;state["analyses"]+=1;state["last_frame"]=time.time();state["last_analysis"]=time.time();state["image_received"]=True
             state["feed"]="LIVE";state["engine"]="LIVE_ANALYSIS";state["width"]=arr.shape[1];state["height"]=arr.shape[0]
-            state["signal"]=result["signal"];state["confidence"]=result["confidence"];state["reason"]=result["reason"];state["indicators"]=result["indicators"];state["last_error"]=None
+            state["signal"]=result["signal"];state["confidence"]=result["confidence"];state["reason"]=result["reason"];state["indicators"]=result["indicators"];state["payout"]=result["indicators"].get("payout");state["otc_verified"]=result["indicators"].get("mode")=="OTC" if state["asset"].lower().endswith("_otc") else True;state["strategy"]="MTF_CONFLUENCE";state["last_error"]=None
             if result["price"] is not None:state["price"]=result["price"];state["entry"]=result["price"]
             if metadata.get("asset") in ALL_ASSETS:state["asset"]=metadata["asset"]
             if metadata.get("timeframe") in TIMEFRAMES:state["timeframe"]=metadata["timeframe"]
@@ -272,6 +387,9 @@ def feed_compat():
     with lock:
         if d.get("asset") in ALL_ASSETS:state["asset"]=d["asset"]
         if d.get("timeframe") in TIMEFRAMES:state["timeframe"]=d["timeframe"]
+        if d.get("payout") is not None:
+            try: state["payout"]=float(d["payout"])
+            except Exception: pass
         if d.get("price") is not None:
             try:state["price"]=float(d["price"]);state["entry"]=state["price"]
             except:pass
@@ -1260,62 +1378,4 @@ init();
 # AUDIT 0945: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0946: conflict gate path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0947: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0948: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0949: diagnostics path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0950: mobile layout path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0951: Render compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0952: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0953: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0954: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0955: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0956: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0957: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0958: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0959: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0960: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0961: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0962: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0963: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0964: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0965: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0966: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0967: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0968: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0969: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0970: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0971: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0972: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0973: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0974: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0975: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0976: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0977: diagnostics path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0978: mobile layout path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0979: Render compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0980: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0981: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0982: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0983: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0984: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0985: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0986: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0987: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0988: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0989: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0990: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0991: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0992: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0993: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0994: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0995: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0996: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0997: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0998: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0999: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1000: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1001: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1002: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1003: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1004: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 1005: diagnostics path is intentionally explicit for maintainability and troublesh
-Preview truncated for large file
+# AUDIT 0948: dashboa
