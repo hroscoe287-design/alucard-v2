@@ -14,8 +14,9 @@ app = Flask(__name__)
 PORT = int(os.getenv("PORT", "10000"))
 TOKEN = os.getenv("ALUCARD_FEED_TOKEN") or os.getenv("RYU_FEED_TOKEN") or ""
 STALE = float(os.getenv("STALE_SECONDS", "8"))
-MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "60"))
-ENTRY_SECONDS = int(os.getenv("ENTRY_SECONDS", "12"))
+MIN_CONF = max(90.0, float(os.getenv("MIN_CONFIDENCE", "90")))
+ENTRY_SECONDS = max(1, int(os.getenv("ENTRY_SECONDS", "12")))
+SIGNAL_LOCK_FRACTION = float(os.getenv("SIGNAL_LOCK_FRACTION", "0.50"))
 MAX_IMAGE = 8 * 1024 * 1024
 
 # ----------------------------- assets --------------------------------------
@@ -38,6 +39,7 @@ state = {
  "asset":"EURUSD_otc","timeframe":"1m","signal":"WAIT","confidence":0,
  "price":None,"entry":None,"entry_window":0,"feed":"DISCONNECTED","engine":"WAITING_FOR_FEED",
  "frames":0,"analyses":0,"last_frame":None,"last_analysis":None,"image_received":False,
+ "signal_sent_at":None,"signal_expires_at":None,"signal_lock_until":None,"signal_id":0,
  "width":0,"height":0,"reason":"Waiting for a fresh screen frame","indicators":{},"payout":None,"otc_verified":True,"strategy":"MTF_CONFLUENCE","last_error":None
 }
 lock = threading.RLock()
@@ -203,7 +205,35 @@ def candle_features(series,bucket):
             "rsi":rsi(c),"macd":macd(c)[0],"macd_signal":macd(c)[1],"macd_hist":macd(c)[2],
             "cci":cci(c),"atr":atr(c),"slope":slope(c),"stoch":stoch(c),"adx":adx_proxy(c),
             "wma":wma(c,10),"last":c[-1],"body":float(c[-1]-o[-1]),
-            "range":float(h[-1]-l[-1])+1e-9}
+            "range":float(h[-1]-l[-1])+1e-9,"fractal2":fractal2({"high":h,"low":l,"close":c})}
+
+def fractal2(candles):
+    """Confirmed 2-left/2-right fractal structure (non-repainting).
+
+    A fractal is only confirmed after two bars to its right have completed.
+    This makes it useful as a reversal/turning-point confirmation rather than
+    a prediction based on an unfinished candle.
+    """
+    h=np.asarray(candles["high"],float); l=np.asarray(candles["low"],float); c=np.asarray(candles["close"],float)
+    n=len(c)
+    if n < 7:
+        return {"high_index":None,"low_index":None,"bias":"NEUTRAL","reversal":"NONE","age":None,"confirmed":False}
+    hi=[]; lo=[]
+    for i in range(2,n-2):
+        if h[i] > h[i-1] and h[i] > h[i-2] and h[i] >= h[i+1] and h[i] >= h[i+2]: hi.append(i)
+        if l[i] < l[i-1] and l[i] < l[i-2] and l[i] <= l[i+1] and l[i] <= l[i+2]: lo.append(i)
+    high_i=hi[-1] if hi else None; low_i=lo[-1] if lo else None
+    # Recent confirmed swing is the most useful reversal reference.
+    if high_i is None and low_i is None:
+        return {"high_index":None,"low_index":None,"bias":"NEUTRAL","reversal":"NONE","age":None,"confirmed":False}
+    latest=max([i for i in (high_i,low_i) if i is not None])
+    age=n-1-latest
+    reversal="BEARISH_REVERSAL" if high_i==latest else "BULLISH_REVERSAL"
+    bias="BEARISH" if high_i==latest else "BULLISH"
+    # Require a recent swing; old fractals are structural context, not an entry trigger.
+    recent=age <= 5
+    return {"high_index":high_i,"low_index":low_i,"bias":bias if recent else "NEUTRAL","reversal":reversal if recent else "NONE","age":age,"confirmed":True,"recent":recent,
+            "high_price":None if high_i is None else float(h[high_i]),"low_price":None if low_i is None else float(l[low_i])}
 
 def analyze(arr, metadata=None):
     """Screen-feed engine.
@@ -247,25 +277,63 @@ def analyze(arr, metadata=None):
         checks.append({"name":name,"value":val,"weight":weight,"detail":detail})
 
     selected=next((f for n,f in views if n=="selected"),views[-1][1])
-    for name,f in views:
-        tag=name.upper()
-        add(f"{tag} EMA 9/20","bull" if f["ema9"]>f["ema20"] else "bear" if f["ema9"]<f["ema20"] else "neutral",1.15 if name=="selected" else .65)
-        add(f"{tag} EMA 20/50","bull" if f["ema20"]>f["ema50"] else "bear" if f["ema20"]<f["ema50"] else "neutral",1.0 if name=="selected" else .55)
-        add(f"{tag} MACD","bull" if f["macd_hist"]>0 else "bear" if f["macd_hist"]<0 else "neutral",1.05 if name=="selected" else .5)
-        add(f"{tag} RSI","bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",.85 if name=="selected" else .4)
-        add(f"{tag} CCI","bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",.7 if name=="selected" else .35)
-        add(f"{tag} Momentum","bull" if f["last"]>f["wma"] and f["body"]>0 else "bear" if f["last"]<f["wma"] and f["body"]<0 else "neutral",.8 if name=="selected" else .4)
-        add(f"{tag} Trend slope","bull" if f["slope"]>0 else "bear" if f["slope"]<0 else "neutral",.75 if name=="selected" else .35)
-
-    # Alligator-style structure on the selected reconstructed closes.
     c=selected["close"]
+
+    # CORE ENGINE: Alligator + moving-average structure + MACD carry most of
+    # the directional weight. Other indicators are filters/confirmation only.
+    core_bull=core_bear=0.0
+    def core(side, weight):
+        nonlocal core_bull,core_bear
+        if side=="bull": core_bull+=weight
+        elif side=="bear": core_bear+=weight
+
+    # Alligator structure and separation.
     jaw=ema(c,13)[-1]; teeth=ema(c,8)[-1]; lips=ema(c,5)[-1]
-    add("Alligator","bull" if lips>teeth>jaw else "bear" if lips<teeth<jaw else "neutral",1.0)
-    add("Parabolic SAR proxy","bull" if selected["ema9"]>selected["ema20"] and selected["slope"]>0 else "bear" if selected["ema9"]<selected["ema20"] and selected["slope"]<0 else "neutral",.7)
-    add("Bollinger","bull" if selected["last"]>np.mean(c[-min(20,len(c)):]) else "bear" if selected["last"]<np.mean(c[-min(20,len(c)):]) else "neutral",.65)
-    add("Stochastic","bull" if selected["stoch"]>55 and selected["stoch"]<90 else "bear" if selected["stoch"]<45 and selected["stoch"]>10 else "neutral",.55)
-    add("ADX / trend strength","neutral" if selected["adx"]<15 else ("bull" if bull>bear else "bear" if bear>bull else "neutral"),.55, f"{selected['adx']:.1f}")
+    alligator_side="bull" if lips>teeth>jaw else "bear" if lips<teeth<jaw else "neutral"
+    core(alligator_side,4.0)
+    add("Alligator CORE",alligator_side,4.0,"Lips/Teeth/Jaw")
+
+    # Moving-average alignment: EMA 9/20/50.
+    ma_side="bull" if selected["ema9"]>selected["ema20"]>selected["ema50"] else "bear" if selected["ema9"]<selected["ema20"]<selected["ema50"] else "neutral"
+    core(ma_side,3.5)
+    add("Moving Averages CORE",ma_side,3.5,"EMA 9/20/50 alignment")
+
+    # MACD direction plus histogram momentum.
+    macd_side="bull" if selected["macd"]>selected["macd_signal"] and selected["macd_hist"]>0 else "bear" if selected["macd"]<selected["macd_signal"] and selected["macd_hist"]<0 else "neutral"
+    core(macd_side,3.5)
+    add("MACD CORE",macd_side,3.5,f"hist {selected['macd_hist']:.5f}")
+
+    # Multi-timeframe agreement reinforces the core but never replaces it.
+    for name,f in views:
+        tag=name.upper(); w=1.0 if name=="selected" else .55
+        add(f"{tag} EMA 9/20","bull" if f["ema9"]>f["ema20"] else "bear" if f["ema9"]<f["ema20"] else "neutral",w)
+        add(f"{tag} EMA 20/50","bull" if f["ema20"]>f["ema50"] else "bear" if f["ema20"]<f["ema50"] else "neutral",w*.8)
+        add(f"{tag} MACD","bull" if f["macd_hist"]>0 else "bear" if f["macd_hist"]<0 else "neutral",w*.9)
+        add(f"{tag} RSI","bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",w*.55)
+        add(f"{tag} CCI","bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",w*.45)
+        add(f"{tag} Momentum","bull" if f["last"]>f["wma"] and f["body"]>0 else "bear" if f["last"]<f["wma"] and f["body"]<0 else "neutral",w*.55)
+
+    # Fractal 2 is deliberately reversal-focused. It is a strong bonus when
+    # the confirmed swing agrees with a turning core; conflict blocks a trade.
+    fr=selected["fractal2"]
+    candidate="bull" if core_bull>core_bear else "bear" if core_bear>core_bull else "neutral"
+    fractal_side="bull" if fr["reversal"]=="BULLISH_REVERSAL" else "bear" if fr["reversal"]=="BEARISH_REVERSAL" else "neutral"
+    if fractal_side!="neutral":
+        add("Fractal 2 REVERSAL",fractal_side,3.25,f"confirmed age {fr['age']} bars")
+        if fractal_side==candidate: bull += 3.25 if candidate=="bull" else 0; bear += 3.25 if candidate=="bear" else 0
+        else: checks.append({"name":"Fractal 2 conflict","value":"BLOCKED","weight":0,"detail":"reversal conflicts with core direction"})
+    else:
+        checks.append({"name":"Fractal 2 REVERSAL","value":"NEUTRAL","weight":0,"detail":"no recent confirmed 2-bar reversal"})
+
+    # Secondary filters.
+    add("Parabolic SAR proxy","bull" if selected["ema9"]>selected["ema20"] and selected["slope"]>0 else "bear" if selected["ema9"]<selected["ema20"] and selected["slope"]<0 else "neutral",.8)
+    add("Bollinger","bull" if selected["last"]>np.mean(c[-min(20,len(c)):]) else "bear" if selected["last"]<np.mean(c[-min(20,len(c)):]) else "neutral",.7)
+    add("Stochastic","bull" if selected["stoch"]>55 and selected["stoch"]<90 else "bear" if selected["stoch"]<45 and selected["stoch"]>10 else "neutral",.6)
+    add("ADX / trend strength","neutral" if selected["adx"]<15 else candidate,.6,f"{selected['adx']:.1f}")
     add("Screen candle color","bull" if green>red*1.15 else "bear" if red>green*1.15 else "neutral",.45)
+
+    # Give the core engine a visible score so diagnostics show why a signal was held.
+    bull += core_bull; bear += core_bear
 
     # Volatility guard: extremely compressed or wildly unstable images are WAIT.
     vol=float(selected["atr"])
@@ -276,14 +344,23 @@ def analyze(arr, metadata=None):
 
     total=bull+bear
     edge=abs(bull-bear)/(total+1e-9)
-    conf=50+48*edge
+    # Confidence is a confluence score, not a claimed win probability.
+    conf=50+49*edge
     signal="CALL" if bull>bear else "PUT" if bear>bull else "WAIT"
 
-    # Require confluence rather than a single indicator. This deliberately favors WAIT.
+    # HARD STRONG-SIGNAL GATE: core agreement + confirmed Fractal 2 reversal.
     dominance=max(bull,bear)/(total+1e-9)
-    if dominance<0.62 or total<6.0 or compression:
+    strong_checks=sum(1 for x in checks if x.get("value") in ("BULLISH","BEARISH"))
+    directional_checks=sum(1 for x in checks if x.get("value") == ("BULLISH" if signal=="CALL" else "BEARISH"))
+    opposite_checks=sum(1 for x in checks if x.get("value") == ("BEARISH" if signal=="CALL" else "BULLISH"))
+    core_direction="CALL" if core_bull>core_bear else "PUT" if core_bear>core_bull else "WAIT"
+    fractal_ok=(fractal_side==("bull" if signal=="CALL" else "bear")) and fr.get("recent",False)
+    fractal_conflict=(fractal_side!="neutral" and not fractal_ok)
+    # Strong reversal entries require the Fractal 2 turn and the three core
+    # families to point the same way. This intentionally produces more WAITs.
+    if (core_direction!=signal or not fractal_ok or fractal_conflict or dominance<0.84 or total<13.0 or strong_checks<12 or directional_checks<9 or opposite_checks>1 or compression or conf<MIN_CONF):
         signal="WAIT"
-    if signal=="WAIT": conf=min(conf,59)
+    if signal=="WAIT": conf=min(conf,89.9)
 
     asset=str(metadata.get("asset") or state.get("asset") or "EURUSD_otc")
     payout=metadata.get("payout")
@@ -308,10 +385,12 @@ def analyze(arr, metadata=None):
       "cci":round(float(selected["cci"]),2),"atr":round(float(selected["atr"]),5),"slope":round(float(selected["slope"]),5),
       "stoch":round(float(selected["stoch"]),2),"adx":round(float(selected["adx"]),2),
       "alligator":"BULL" if lips>teeth>jaw else "BEAR" if lips<teeth<jaw else "MIXED",
+      "core_engine":{"alligator":alligator_side.upper(),"moving_averages":ma_side.upper(),"macd":macd_side.upper(),"direction":core_direction},
+      "fractal2":fr,
       "bull_pixels":round(green,4),"bear_pixels":round(red,4),"bull_score":round(bull,2),"bear_score":round(bear,2),
       "checks":checks
     }
-    reasons=[f"{bull:.1f} bullish / {bear:.1f} bearish",f"MTF: {','.join(n for n,_ in views)}"]
+    reasons=[f"CORE: Alligator {alligator_side.upper()} • MA {ma_side.upper()} • MACD {macd_side.upper()}",f"Fractal 2: {fr.get('reversal','NONE')}",f"{bull:.1f} bullish / {bear:.1f} bearish",f"MTF: {','.join(n for n,_ in views)}"]
     if otc: reasons.append("OTC asset mode")
     if payout is not None and not payout_ok: reasons.append(f"payout {payout:.0f}% below {payout_floor:.0f}% floor")
     if compression: reasons.append("low volatility")
@@ -343,11 +422,47 @@ def config():
     d=request.get_json(silent=True) or {}
     with lock:
         if d.get("asset") in ALL_ASSETS:state["asset"]=d["asset"]
-        if d.get("timeframe") in TIMEFRAMES:state["timeframe"]=d["timeframe"]
+        if d.get("timeframe") in TIMEFRAMES and d.get("timeframe") != state["timeframe"]:
+            state["timeframe"]=d["timeframe"];state["signal"]="WAIT";state["confidence"]=0;state["entry_window"]=0;state["signal_expires_at"]=None;state["signal_lock_until"]=None
         if d.get("payout") is not None:
             try: state["payout"]=float(d["payout"])
             except Exception: pass
     return jsonify(ok=True,asset=state["asset"],timeframe=state["timeframe"])
+def signal_lock_active(now=None):
+    now=time.time() if now is None else now
+    with lock:
+        until=state.get("signal_lock_until")
+    return until is not None and now < until
+
+def commit_signal(result):
+    """Commit only strong signals and keep them stable for half the selected timeframe.
+    The entry countdown is separate and starts only when a new strong signal is emitted.
+    """
+    now=time.time()
+    incoming=result["signal"] if result["confidence"]>=MIN_CONF else "WAIT"
+    with lock:
+        current=state["signal"]
+        lock_until=state.get("signal_lock_until")
+        if incoming in ("CALL","PUT"):
+            if current in ("CALL","PUT") and lock_until is not None and now < lock_until:
+                return current, state.get("confidence",0), False
+            tf_seconds=int(TIMEFRAMES.get(state.get("timeframe","1m"),60))
+            hold=max(ENTRY_SECONDS, int(tf_seconds*SIGNAL_LOCK_FRACTION))
+            state["signal"]=incoming
+            state["confidence"]=float(result["confidence"])
+            state["signal_sent_at"]=now
+            state["signal_expires_at"]=now+ENTRY_SECONDS
+            state["signal_lock_until"]=now+hold
+            state["signal_id"]+=1
+            state["entry_window"]=ENTRY_SECONDS
+            return incoming,float(result["confidence"]),True
+        if current in ("CALL","PUT") and lock_until is not None and now < lock_until:
+            return current,state.get("confidence",0),False
+        state["signal"]="WAIT"
+        state["confidence"]=float(result["confidence"])
+        state["entry_window"]=0
+        return "WAIT",float(result["confidence"]),False
+
 @app.post("/api/frame")
 def frame():
     if not auth():return jsonify(ok=False,error="Unauthorized"),401
@@ -364,16 +479,17 @@ def frame():
         with lock:
             state["frames"]+=1;state["analyses"]+=1;state["last_frame"]=time.time();state["last_analysis"]=time.time();state["image_received"]=True
             state["feed"]="LIVE";state["engine"]="LIVE_ANALYSIS";state["width"]=arr.shape[1];state["height"]=arr.shape[0]
-            state["signal"]=result["signal"];state["confidence"]=result["confidence"];state["reason"]=result["reason"];state["indicators"]=result["indicators"];state["payout"]=result["indicators"].get("payout");state["otc_verified"]=result["indicators"].get("mode")=="OTC" if state["asset"].lower().endswith("_otc") else True;state["strategy"]="MTF_CONFLUENCE";state["last_error"]=None
+            state["reason"]=result["reason"];state["indicators"]=result["indicators"];state["payout"]=result["indicators"].get("payout");state["otc_verified"]=result["indicators"].get("mode")=="OTC" if state["asset"].lower().endswith("_otc") else True;state["strategy"]="MTF_CONFLUENCE_STRONG_ONLY";state["last_error"]=None
             if result["price"] is not None:state["price"]=result["price"];state["entry"]=result["price"]
             if metadata.get("asset") in ALL_ASSETS:state["asset"]=metadata["asset"]
             if metadata.get("timeframe") in TIMEFRAMES:state["timeframe"]=metadata["timeframe"]
             # Screen-feed uploads usually contain no metadata; keep the dashboard selection.
             if state["asset"] not in ALL_ASSETS: state["asset"]="EURUSD_otc"
             if state["timeframe"] not in TIMEFRAMES: state["timeframe"]="1m"
-            state["entry_window"]=ENTRY_SECONDS if result["signal"] in ("CALL","PUT") and result["confidence"]>=MIN_CONF else 0
-            rec={"time":iso(),"asset":state["asset"],"timeframe":state["timeframe"],"signal":result["signal"],"confidence":result["confidence"],"price":state["price"],"reason":result["reason"]}
-            history.appendleft(rec)
+            committed_signal, committed_conf, is_new = commit_signal(result)
+            if is_new:
+                rec={"time":iso(),"asset":state["asset"],"timeframe":state["timeframe"],"signal":committed_signal,"confidence":committed_conf,"price":state["price"],"reason":result["reason"],"signal_id":state["signal_id"]}
+                history.appendleft(rec)
         return jsonify(ok=True,message="Frame accepted and analyzed",signal=result["signal"],confidence=result["confidence"],reason=result["reason"],feed="LIVE",image_received=True,state=dict(state))
     except Exception as e:
         setdiag(e)
@@ -393,8 +509,15 @@ def feed_compat():
         if d.get("price") is not None:
             try:state["price"]=float(d["price"]);state["entry"]=state["price"]
             except:pass
-        if d.get("signal") in ("CALL","PUT","WAIT"):state["signal"]=d["signal"]
-        if d.get("confidence") is not None:state["confidence"]=float(d["confidence"])
+        # JSON feed may display broker metadata, but it cannot bypass the strong-signal engine.
+        if d.get("confidence") is not None:
+            try:
+                incoming_conf=float(d["confidence"])
+                if incoming_conf>=MIN_CONF and d.get("signal") in ("CALL","PUT") and not signal_lock_active():
+                    state["signal"]=d["signal"];state["confidence"]=incoming_conf
+                    now=time.time();state["signal_sent_at"]=now;state["signal_expires_at"]=now+ENTRY_SECONDS
+                    state["signal_lock_until"]=now+max(ENTRY_SECONDS,int(TIMEFRAMES.get(state["timeframe"],60)*SIGNAL_LOCK_FRACTION));state["signal_id"]+=1;state["entry_window"]=ENTRY_SECONDS
+            except Exception: pass
         state["feed"]="LIVE";state["last_frame"]=time.time();state["image_received"]=False;state["engine"]="JSON_FEED"
     return jsonify(ok=True,message="JSON feed accepted",state=dict(state))
 
@@ -408,24 +531,32 @@ def watchdog():
                 state["feed"]="DISCONNECTED"
                 if state["frames"]==0:state["engine"]="WAITING_FOR_FEED"
             elif a>STALE:
-                state["feed"]="STALE";state["engine"]="FEED_STALE";state["signal"]="WAIT";state["confidence"]=0;state["entry_window"]=0;state["reason"]=f"No fresh frame for {a:.1f}s"
+                state["feed"]="STALE";state["engine"]="FEED_STALE";state["signal"]="WAIT";state["confidence"]=0;state["entry_window"]=0;state["signal_lock_until"]=None;state["reason"]=f"No fresh frame for {a:.1f}s"
             else:
                 state["feed"]="LIVE"
+                now=time.time()
+                exp=state.get("signal_expires_at")
+                lock_until=state.get("signal_lock_until")
+                if exp is not None:
+                    state["entry_window"]=max(0,int(math.ceil(exp-now)))
+                if state.get("signal") in ("CALL","PUT") and lock_until is not None and now>=lock_until:
+                    state["signal"]="WAIT";state["confidence"]=0;state["entry_window"]=0;state["signal_expires_at"]=None;state["signal_lock_until"]=None;state["reason"]="Signal hold completed; waiting for next strong setup"
 threading.Thread(target=watchdog,daemon=True).start()
 
 HTML=r'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>ALUCARD V2.2</title><style>
 *{box-sizing:border-box}body{margin:0;background:#070709;color:#eee;font-family:Arial,sans-serif}header{padding:16px 18px;border-bottom:1px solid #3a1018;background:#10090d;display:flex;justify-content:space-between;gap:10px;align-items:center;position:sticky;top:0;z-index:5}.brand{font-size:25px;font-weight:900;letter-spacing:3px;color:#e5223d}.sub{font-size:10px;color:#9e8490;letter-spacing:1px}.badges{display:flex;gap:8px}.badge{border:1px solid #4b2430;border-radius:20px;padding:7px 10px;font-size:10px}.live{color:#35f19a}.dead{color:#ff4055}.warn{color:#f2bd45}main{padding:15px;max-width:1500px;margin:auto}.tabs{display:flex;gap:7px;overflow:auto;margin-bottom:14px}.tabs button,.apply{background:#120d11;color:#ddd;border:1px solid #47212c;border-radius:8px;padding:10px 15px;font-weight:800}.tabs button.active,.apply{background:#721326;border-color:#e5223d}.layout{display:grid;grid-template-columns:300px 1fr 320px;gap:14px}.card{background:linear-gradient(180deg,#130d11,#0d0b0e);border:1px solid #3b1822;border-radius:13px;padding:14px}.title{font-size:12px;color:#d9a4ae;font-weight:900;letter-spacing:1px;margin-bottom:12px}select,input{width:100%;padding:10px;background:#09090b;border:1px solid #43202a;color:#eee;border-radius:8px}label{font-size:10px;color:#967f88;display:block;margin:10px 0 5px}.assetlist{height:330px;overflow:auto;margin-top:10px}.cat{font-size:10px;color:#e5223d;padding:9px 5px 4px}.asset{padding:8px 7px;border-bottom:1px solid #21151a;font-size:11px;cursor:pointer}.asset:hover{background:#211018}.chart{height:430px;border-radius:10px;border:1px solid #30242a;background:repeating-linear-gradient(0deg,#07140d 0,#07140d 59px,#11251a 60px),repeating-linear-gradient(90deg,transparent 0,transparent 69px,#11251a 70px);display:flex;align-items:center;justify-content:center;color:#6d8576;text-align:center}.skull{font-size:50px;color:#e5223d}.signal{text-align:center;font-size:64px;font-weight:1000;letter-spacing:4px;margin:13px 0}.call{color:#27ef8d}.put{color:#ff4055}.wait{color:#e7b63c}.conf{text-align:center;font-size:28px;font-weight:900}.reason{text-align:center;color:#9b8991;font-size:11px;margin:8px}.row{display:flex;justify-content:space-between;border-bottom:1px solid #23171c;padding:9px 0;font-size:11px}.muted{color:#8f7e87}.ind{white-space:pre-wrap;font-size:9px;color:#b8abb0;max-height:300px;overflow:auto}.statusline{font-size:10px;color:#8e7d85;margin-top:12px}.history{max-height:300px;overflow:auto;font-size:10px}.hrow{padding:8px;border-bottom:1px solid #24171c;display:flex;justify-content:space-between}.green{color:#27ef8d}.red{color:#ff4055}@media(max-width:1050px){.layout{grid-template-columns:1fr}.assetlist{height:240px}.chart{height:330px}}
-</style></head><body><header><div><div class="brand">☠ ALUCARD V2.2</div><div class="sub">GOTHIC MARKET INTELLIGENCE • SCREEN-FEED ENGINE</div></div><div class="badges"><span id="feed" class="badge warn">FEED: CHECKING</span><span id="engine" class="badge warn">ENGINE: CHECKING</span></div></header><main><div class="tabs"><button class="active" onclick="tab('signals',this)">Signals</button><button onclick="tab('trades',this)">Trades</button><button onclick="tab('performance',this)">Performance</button><button onclick="tab('settings',this)">Settings</button></div><section id="signals"><div class="layout"><aside class="card"><div class="title">POCKET OPTION ASSETS</div><label>Search</label><input id="search" placeholder="EURUSD, BTCUSD, Gold..." oninput="renderAssets()"><label>Selected asset</label><select id="asset"></select><label>Timeframe</label><select id="tf"></select><button class="apply" style="width:100%;margin-top:9px" onclick="applyConfig()">APPLY</button><div id="assetlist" class="assetlist"></div></aside><section class="card"><div class="title">LIVE CHART INTELLIGENCE</div><div class="chart"><div><div class="skull">☠</div><div id="chartmsg">WAITING FOR SCREEN FRAME</div><div style="font-size:9px">bridge.py → POST JPEG → /api/frame</div></div></div><div id="signal" class="signal wait">WAIT</div><div id="conf" class="conf">0%</div><div id="reason" class="reason">Waiting for fresh chart data</div></section><aside class="card"><div class="title">LIVE STATE</div><div class="row"><span class="muted">Asset</span><b id="sasset">—</b></div><div class="row"><span class="muted">Timeframe</span><b id="stf">—</b></div><div class="row"><span class="muted">Price</span><b id="price">—</b></div><div class="row"><span class="muted">Entry</span><b id="entry">—</b></div><div class="row"><span class="muted">Entry window</span><b id="window">—</b></div><div class="row"><span class="muted">Frames</span><b id="frames">0</b></div><div class="row"><span class="muted">Analyses</span><b id="analyses">0</b></div><div class="row"><span class="muted">Feed age</span><b id="age">—</b></div><div class="statusline" id="dims">No image</div><div class="title" style="margin-top:18px">INDICATORS</div><pre id="ind" class="ind">{}</pre></aside></div></section><section id="trades" style="display:none"><div class="card"><div class="title">SIGNAL HISTORY</div><div id="hist" class="history"></div></div></section><section id="performance" style="display:none"><div class="card"><div class="title">PERFORMANCE</div><p class="muted" style="font-size:11px">Signals are recorded here for review. The screen feed does not provide broker settlement results, so no win rate is fabricated.</p></div></section><section id="settings" style="display:none"><div class="card"><div class="title">ENGINE SETTINGS</div><div class="row"><span class="muted">Minimum confidence</span><b>60%</b></div><div class="row"><span class="muted">Fresh-frame cutoff</span><b>8s</b></div><div class="row"><span class="muted">Entry window</span><b>12s</b></div><div class="row"><span class="muted">Source</span><b>Screen Stream RTSP → bridge</b></div><div class="row"><span class="muted">Execution</span><b>Signal only</b></div></div></section></main><script>
+</style></head><body><header><div><div class="brand">☠ ALUCARD V2.2</div><div class="sub">GOTHIC MARKET INTELLIGENCE • SCREEN-FEED ENGINE</div></div><div class="badges"><span id="feed" class="badge warn">FEED: CHECKING</span><span id="engine" class="badge warn">ENGINE: CHECKING</span></div></header><main><div class="tabs"><button class="active" onclick="tab('signals',this)">Signals</button><button onclick="tab('trades',this)">Trades</button><button onclick="tab('performance',this)">Performance</button><button onclick="tab('settings',this)">Settings</button></div><section id="signals"><div class="layout"><aside class="card"><div class="title">POCKET OPTION ASSETS</div><label>Search</label><input id="search" placeholder="EURUSD, BTCUSD, Gold..." oninput="renderAssets()"><label>Selected asset</label><select id="asset"></select><label>Timeframe</label><select id="tf"></select><button class="apply" style="width:100%;margin-top:9px" onclick="applyConfig()">APPLY</button><div id="assetlist" class="assetlist"></div></aside><section class="card"><div class="title">LIVE CHART INTELLIGENCE</div><div class="chart"><div><div class="skull">☠</div><div id="chartmsg">WAITING FOR SCREEN FRAME</div><div style="font-size:9px">bridge.py → POST JPEG → /api/frame</div></div></div><div class="row" style="margin-top:10px"><span class="muted">REAL-TIME CLOCK</span><b id="clock">--:--:--</b></div><div id="signal" class="signal wait">WAIT</div><div id="conf" class="conf">0%</div><div id="countdown" style="text-align:center;font-size:30px;font-weight:900;margin-top:6px">ENTRY: —</div><div id="reason" class="reason">Waiting for fresh chart data</div></section><aside class="card"><div class="title">LIVE STATE</div><div class="row"><span class="muted">Asset</span><b id="sasset">—</b></div><div class="row"><span class="muted">Timeframe</span><b id="stf">—</b></div><div class="row"><span class="muted">Price</span><b id="price">—</b></div><div class="row"><span class="muted">Entry</span><b id="entry">—</b></div><div class="row"><span class="muted">Entry window</span><b id="window">—</b></div><div class="row"><span class="muted">Signal sent</span><b id="sent">—</b></div><div class="row"><span class="muted">Signal lock</span><b id="lock">—</b></div><div class="row"><span class="muted">Frames</span><b id="frames">0</b></div><div class="row"><span class="muted">Analyses</span><b id="analyses">0</b></div><div class="row"><span class="muted">Feed age</span><b id="age">—</b></div><div class="statusline" id="dims">No image</div><div class="title" style="margin-top:18px">INDICATORS</div><pre id="ind" class="ind">{}</pre></aside></div></section><section id="trades" style="display:none"><div class="card"><div class="title">SIGNAL HISTORY</div><div id="hist" class="history"></div></div></section><section id="performance" style="display:none"><div class="card"><div class="title">PERFORMANCE</div><p class="muted" style="font-size:11px">Signals are recorded here for review. The screen feed does not provide broker settlement results, so no win rate is fabricated.</p></div></section><section id="settings" style="display:none"><div class="card"><div class="title">ENGINE SETTINGS</div><div class="row"><span class="muted">Minimum confidence</span><b>90%</b></div><div class="row"><span class="muted">Fresh-frame cutoff</span><b>8s</b></div><div class="row"><span class="muted">Entry window</span><b>12s</b></div><div class="row"><span class="muted">Signal hold</span><b>50% of selected timeframe</b></div><div class="row"><span class="muted">Signal policy</span><b>STRONG ONLY / WAIT ON CONFLICT</b></div><div class="row"><span class="muted">Win-rate display</span><b>No fabricated percentage</b></div><div class="row"><span class="muted">Source</span><b>Screen Stream RTSP → bridge</b></div><div class="row"><span class="muted">Execution</span><b>Signal only</b></div></div></section></main><script>
 let groups={},flat=[],cur={};const $=id=>document.getElementById(id);
 async function j(u,o){let r=await fetch(u,o);return await r.json()}
-async function init(){let a=await j('/api/assets');groups=a.groups||{};flat=a.all||[];let t=await j('/api/timeframes');$('tf').innerHTML=Object.entries(t).map(([k,v])=>`<option value="${k}">${k}</option>`).join('');$('asset').innerHTML=flat.map(x=>`<option>${x}</option>`).join('');$('asset').value='EURUSD_otc';$('tf').value='1m';renderAssets();refresh();setInterval(refresh,1000);setInterval(loadHistory,3000)}
+async function init(){let a=await j('/api/assets');groups=a.groups||{};flat=a.all||[];let t=await j('/api/timeframes');$('tf').innerHTML=Object.entries(t).map(([k,v])=>`<option value="${k}">${k} • ${v}s</option>`).join('');$('asset').innerHTML=flat.map(x=>`<option>${x}</option>`).join('');renderAssets();refresh();setInterval(refresh,1000);setInterval(updateClocks,250);setInterval(loadHistory,3000);updateClocks()}
 function renderAssets(){let q=$('search').value.toLowerCase();let box=$('assetlist');box.innerHTML='';Object.entries(groups).forEach(([g,xs])=>{let ys=xs.filter(x=>x.toLowerCase().includes(q));if(!ys.length)return;box.innerHTML+=`<div class="cat">${g.toUpperCase()}</div>`;ys.forEach(x=>box.innerHTML+=`<div class="asset" onclick="pick('${x}')">${x}</div>`)})}
 function pick(x){$('asset').value=x;applyConfig()}
-async function applyConfig(){await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset:$('asset').value,timeframe:$('tf').value})});refresh()}
+async function applyConfig(){let r=await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset:$('asset').value,timeframe:$('tf').value})});if(r.ok){$('stf').textContent=r.timeframe||$('tf').value;$('signal').textContent='WAIT';$('conf').textContent='0%';$('countdown').textContent='ENTRY: —';$('reason').textContent='Timeframe applied. Waiting for a fresh strong setup.'}refresh()}
+function updateClocks(){const now=Date.now()/1000;const d=new Date();$('clock').textContent=d.toLocaleTimeString([], {hour12:false});if(!cur||!cur.signal_sent_at){$('countdown').textContent='ENTRY: —';$('sent').textContent='—';$('lock').textContent='—';return}const sent=new Date(cur.signal_sent_at*1000);$('sent').textContent=sent.toLocaleTimeString([], {hour12:false});let ew=cur.signal_expires_at?Math.max(0,cur.signal_expires_at-now):0;let lu=cur.signal_lock_until?Math.max(0,cur.signal_lock_until-now):0;if(cur.signal==='CALL'||cur.signal==='PUT'){ $('countdown').textContent=ew>0?'ENTRY: '+Math.ceil(ew)+'s':'ENTRY WINDOW CLOSED'; $('lock').textContent=lu>0?Math.ceil(lu)+'s':'READY FOR NEXT SETUP';}else{$('countdown').textContent='ENTRY: —';$('lock').textContent=lu>0?Math.ceil(lu)+'s':'—'}}
 function tab(id,b){['signals','trades','performance','settings'].forEach(x=>$(x).style.display=x===id?'block':'none');document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));b.classList.add('active')}
 function badge(id,text,kind){$(id).textContent=text;$(id).className='badge '+kind}
 function fmt(x){return x===null||x===undefined?'—':typeof x==='number'?Number.isInteger(x)?x:String(Number(x).toFixed(5)):x}
-async function refresh(){try{cur=await j('/api/state');let f=cur.feed;badge('feed','FEED: '+f,f==='LIVE'?'live':f==='STALE'?'warn':'dead');badge('engine','ENGINE: '+cur.engine,cur.engine.includes('LIVE')?'live':cur.engine.includes('WAIT')?'warn':'dead');let s=$('signal');s.textContent=cur.signal||'WAIT';s.className='signal '+(cur.signal==='CALL'?'call':cur.signal==='PUT'?'put':'wait');$('conf').textContent=fmt(cur.confidence)+'%';$('reason').textContent=cur.reason||'—';$('sasset').textContent=cur.asset||'—';$('stf').textContent=cur.timeframe||'—';$('price').textContent=fmt(cur.price);$('entry').textContent=fmt(cur.entry);$('window').textContent=cur.entry_window?cur.entry_window+'s':'—';$('frames').textContent=cur.frames||0;$('analyses').textContent=cur.analyses||0;$('age').textContent=cur.feed_age==null?'—':cur.feed_age.toFixed(1)+'s';$('dims').textContent=cur.width?cur.width+' × '+cur.height:'No image';$('ind').textContent=JSON.stringify(cur.indicators||{},null,2);if(cur.asset)$('asset').value=cur.asset;if(cur.timeframe)$('tf').value=cur.timeframe;$('chartmsg').textContent=cur.feed_live?'LIVE SCREEN ANALYSIS':f==='STALE'?'SCREEN FEED STALE':'WAITING FOR SCREEN FRAME';let fh=cur.feed_health||f;badge('feed','FEED: '+fh,fh==='LIVE'?'live':fh==='STALE'?'warn':'dead')}catch(e){badge('feed','FEED: API ERROR','dead')}}
+async function refresh(){try{cur=await j('/api/state');let f=cur.feed;badge('feed','FEED: '+f,f==='LIVE'?'live':f==='STALE'?'warn':'dead');badge('engine','ENGINE: '+cur.engine,cur.engine.includes('LIVE')?'live':cur.engine.includes('WAIT')?'warn':'dead');let s=$('signal');s.textContent=cur.signal||'WAIT';s.className='signal '+(cur.signal==='CALL'?'call':cur.signal==='PUT'?'put':'wait');$('conf').textContent=fmt(cur.confidence)+'%';$('reason').textContent=cur.reason||'—';$('sasset').textContent=cur.asset||'—';$('stf').textContent=cur.timeframe||'—';$('price').textContent=fmt(cur.price);$('entry').textContent=fmt(cur.entry);$('window').textContent=cur.entry_window?cur.entry_window+'s':'—';$('frames').textContent=cur.frames||0;$('analyses').textContent=cur.analyses||0;$('age').textContent=cur.feed_age==null?'—':cur.feed_age.toFixed(1)+'s';$('dims').textContent=cur.width?cur.width+' × '+cur.height:'No image';$('ind').textContent=JSON.stringify(cur.indicators||{},null,2);if(cur.asset&&document.activeElement!==$('asset'))$('asset').value=cur.asset;if(cur.timeframe&&document.activeElement!==$('tf'))$('tf').value=cur.timeframe;$('sent').textContent=cur.signal_sent_at?new Date(cur.signal_sent_at*1000).toLocaleTimeString([], {hour12:false}):'—';$('lock').textContent=cur.signal_lock_until?Math.max(0,Math.ceil(cur.signal_lock_until-Date.now()/1000))+'s':'—';updateClocks();$('chartmsg').textContent=cur.feed_live?'LIVE SCREEN ANALYSIS':f==='STALE'?'SCREEN FEED STALE':'WAITING FOR SCREEN FRAME';let fh=cur.feed_health||f;badge('feed','FEED: '+fh,fh==='LIVE'?'live':fh==='STALE'?'warn':'dead')}catch(e){badge('feed','FEED: API ERROR','dead')}}
 async function loadHistory(){try{let d=await j('/api/signals');$('hist').innerHTML=(d.signals||[]).map(x=>`<div class="hrow"><span>${x.asset}<br><small>${x.time}</small></span><b class="${x.signal==='CALL'?'green':x.signal==='PUT'?'red':''}">${x.signal} ${x.confidence}%</b></div>`).join('')||'<span class="muted">No signals yet</span>'}catch(e){}}
 init();
 </script></body></html>'''
@@ -1279,103 +1410,4 @@ init();
 # AUDIT 0846: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0847: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0848: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0849: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0850: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0851: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0852: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0853: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0854: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0855: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0856: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0857: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0858: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0859: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0860: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0861: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0862: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0863: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0864: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0865: diagnostics path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0866: mobile layout path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0867: Render compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0868: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0869: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0870: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0871: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0872: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0873: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0874: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0875: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0876: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0877: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0878: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0879: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0880: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0881: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0882: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0883: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0884: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0885: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0886: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0887: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0888: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0889: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0890: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0891: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0892: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0893: diagnostics path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0894: mobile layout path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0895: Render compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0896: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0897: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0898: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0899: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0900: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0901: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0902: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0903: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0904: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0905: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0906: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0907: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0908: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0909: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0910: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0911: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0912: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0913: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0914: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0915: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0916: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0917: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0918: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0919: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0920: dashboard state path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0921: diagnostics path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0922: mobile layout path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0923: Render compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0924: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0925: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0926: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0927: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0928: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0929: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0930: timeframe catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0931: stale-feed protection path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0932: chart crop path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0933: edge path extraction path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0934: visual price normalization path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0935: EMA confluence path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0936: RSI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0937: MACD path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0938: CCI path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0939: Bollinger Bands path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0940: ATR path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0941: Alligator path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0942: Parabolic SAR proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0943: Supertrend proxy path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0944: momentum path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0945: candle-color balance path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0946: conflict gate path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0947: signal history path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0948: dashboa
+# AUDIT 0849: edge path extraction path is intentionally explicit for maintainability and troub
