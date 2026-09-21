@@ -195,15 +195,27 @@ def analyze(arr, metadata=None):
     total=bull+bear; edge=abs(bull-bear)/(total+1e-9)
     # Softer confluence gate: primary direction can trigger without every
     # secondary indicator agreeing.  Keep a real conflict/weakness gate.
-    primary_bull = (e9>e20) + (e20>e50) + (mh>0) + (lips>teeth>jaw)
-    primary_bear = (e9<e20) + (e20<e50) + (mh<0) + (lips<teeth<jaw)
-    primary_edge = abs(primary_bull-primary_bear)
+    # Convert NumPy scalar comparisons to plain Python ints.
+    # This prevents NumPy bool subtraction errors in primary_edge.
+    primary_bull = (
+        int(bool(e9 > e20))
+        + int(bool(e20 > e50))
+        + int(bool(mh > 0))
+        + int(bool(lips > teeth > jaw))
+    )
+    primary_bear = (
+        int(bool(e9 < e20))
+        + int(bool(e20 < e50))
+        + int(bool(mh < 0))
+        + int(bool(lips < teeth < jaw))
+    )
+    primary_edge = abs(int(primary_bull) - int(primary_bear))
     conf=50+49*edge
     if primary_edge>=3: conf=min(99,conf+4)
     elif primary_edge>=2: conf=min(99,conf+2)
     # Fractal-2-style reversal proxy: a sharp recent turn receives a boost,
     # but is never mandatory for a directional signal.
-    turn=(s[-1]-s[-4])*(s[-4]-s[-8])<0 if len(s)>=8 else False
+    turn=bool((s[-1]-s[-4])*(s[-4]-s[-8])<0) if len(s)>=8 else False
     if turn:
         if s[-1]>s[-4] and bull>bear: conf=min(99,conf+2)
         elif s[-1]<s[-4] and bear>bull: conf=min(99,conf+2)
@@ -1314,7 +1326,4 @@ init();
 # AUDIT 0980: Pocket Option-style menu path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0981: feed ingestion path is intentionally explicit for maintainability and troubleshooting.
 # AUDIT 0982: multipart JPEG compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0983: raw image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0984: base64 image compatibility path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0985: asset catalog path is intentionally explicit for maintainability and troubleshooting.
-# AUDIT 0986: timeframe catalog path is intentionally explic
+# AUDIT 0983: raw image compatibility path is intentionally expli
