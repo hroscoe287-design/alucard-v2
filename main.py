@@ -880,6 +880,10 @@ def assets(): return jsonify({"groups":GROUPS,"all":sorted(ALL_ASSETS)})
 def timeframes(): return jsonify(TIMEFRAMES)
 @app.get("/api/signals")
 def signals(): return jsonify({"signals":list(history)})
+@app.get("/api/diagnostics")
+def diagnostics():
+    with lock:
+        return jsonify({"service":"ALUCARD","feed":state.get("feed"),"engine":state.get("engine"),"frames":state.get("frames",0),"analyses":state.get("analyses",0),"image_received":state.get("image_received",False),"feed_age":age(),"asset":state.get("asset"),"timeframe":state.get("timeframe"),"last_error":state.get("last_error"),"pocket_websocket":{"enabled":POCKET_WS_ENABLED,"url_configured":bool(POCKET_WS_URL),"ssid_configured":bool(PO_SSID),"client_installed":_ws_client is not None,"thread_alive":bool(_ws_thread and _ws_thread.is_alive()),"messages":_ws_messages,"ticks":_ws_ticks,"binary_frames":_ws_binary_frames,"last_error":_ws_last_error}})
 @app.post("/api/config")
 def config():
     if not auth():return jsonify(ok=False,error="Unauthorized"),401
@@ -888,6 +892,8 @@ def config():
         if d.get("asset") in ALL_ASSETS:state["asset"]=d["asset"]
         if d.get("timeframe") in TIMEFRAMES and d.get("timeframe") != state["timeframe"]:
             state["timeframe"]=d["timeframe"];state["signal"]="WAIT";state["confidence"]=0;state["entry_window"]=0;state["signal_expires_at"]=None;state["signal_lock_until"]=None
+            state.pop("_ws_prices",None)
+            _ws_candles.clear()
         if d.get("payout") is not None:
             try: state["payout"]=float(d["payout"])
             except Exception: pass
@@ -1001,7 +1007,7 @@ def frame():
             if is_new:
                 rec={"time":iso(),"asset":state["asset"],"timeframe":state["timeframe"],"signal":committed_signal,"confidence":committed_conf,"price":state["price"],"reason":result["reason"],"signal_id":state["signal_id"]}
                 history.appendleft(rec)
-        return jsonify(ok=True,message="Frame accepted and analyzed",signal=result["signal"],confidence=result["confidence"],reason=result["reason"],feed="LIVE",image_received=True,state=dict(state))
+        return jsonify(ok=True,message="Frame accepted and analyzed",signal=result["signal"],confidence=result["confidence"],reason=result["reason"],feed="LIVE",image_received=True,frames=state.get("frames",0),analyses=state.get("analyses",0))
     except Exception as e:
         setdiag(e)
         with lock:state["engine"]="ANALYSIS_ERROR"
@@ -1067,7 +1073,7 @@ function updateClocks(){const now=Date.now()/1000;const d=new Date();$('clock').
 function tab(id,b){['signals','trades','performance','settings'].forEach(x=>$(x).style.display=x===id?'block':'none');document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));b.classList.add('active')}
 function badge(id,text,kind){$(id).textContent=text;$(id).className='badge '+kind}
 function fmt(x){return x===null||x===undefined?'—':typeof x==='number'?Number.isInteger(x)?x:String(Number(x).toFixed(5)):x}
-async function refresh(){try{cur=await j('/api/state');let f=cur.feed;badge('feed','FEED: '+f,f==='LIVE'?'live':f==='STALE'?'warn':'dead');badge('engine','ENGINE: '+cur.engine,cur.engine.includes('LIVE')?'live':cur.engine.includes('WAIT')?'warn':'dead');let s=$('signal');s.textContent=cur.signal||'WAIT';s.className='signal '+(cur.signal==='CALL'?'call':cur.signal==='PUT'?'put':'wait');$('conf').textContent=fmt(cur.confidence)+'%';$('reason').textContent=cur.reason||'—';$('sasset').textContent=cur.asset||'—';$('stf').textContent=cur.timeframe||'—';$('price').textContent=fmt(cur.price);$('entry').textContent=fmt(cur.entry);$('window').textContent=cur.entry_window?cur.entry_window+'s':'—';$('frames').textContent=cur.frames||0;$('analyses').textContent=cur.analyses||0;$('age').textContent=cur.feed_age==null?'—':cur.feed_age.toFixed(1)+'s';$('dims').textContent=cur.width?cur.width+' × '+cur.height:'No image';$('ind').textContent=JSON.stringify(cur.indicators||{},null,2);if(cur.asset&&document.activeElement!==$('asset'))$('asset').value=cur.asset;if(cur.timeframe&&document.activeElement!==$('tf'))$('tf').value=cur.timeframe;$('sent').textContent=cur.signal_sent_at?new Date(cur.signal_sent_at*1000).toLocaleTimeString([], {hour12:false}):'—';$('lock').textContent=cur.signal_lock_until?Math.max(0,Math.ceil(cur.signal_lock_until-Date.now()/1000))+'s':'—';updateClocks();$('chartmsg').textContent=cur.feed_live?'LIVE WEBSOCKET ANALYSIS':f==='STALE'?'WEBSOCKET FEED STALE':'WAITING FOR SCREEN FRAME';let fh=cur.feed_health||f;badge('feed','FEED: '+fh,fh==='LIVE'?'live':fh==='STALE'?'warn':'dead')}catch(e){badge('feed','FEED: API ERROR','dead')}}
+async function refresh(){try{cur=await j('/api/state');let f=cur.feed;badge('feed','FEED: '+f,f==='LIVE'?'live':f==='STALE'?'warn':'dead');badge('engine','ENGINE: '+cur.engine,cur.engine.includes('LIVE')?'live':cur.engine.includes('WAIT')?'warn':'dead');let s=$('signal');s.textContent=cur.signal||'WAIT';s.className='signal '+(cur.signal==='CALL'?'call':cur.signal==='PUT'?'put':'wait');$('conf').textContent=fmt(cur.confidence)+'%';$('reason').textContent=cur.last_error?((cur.reason||'—')+' • ERROR: '+cur.last_error):(cur.reason||'—');$('sasset').textContent=cur.asset||'—';$('stf').textContent=cur.timeframe||'—';$('price').textContent=fmt(cur.price);$('entry').textContent=fmt(cur.entry);$('window').textContent=cur.entry_window?cur.entry_window+'s':'—';$('frames').textContent=cur.frames||0;$('analyses').textContent=cur.analyses||0;$('age').textContent=cur.feed_age==null?'—':cur.feed_age.toFixed(1)+'s';$('dims').textContent=cur.width?cur.width+' × '+cur.height:'No image';$('ind').textContent=JSON.stringify(cur.indicators||{},null,2);if(cur.asset&&document.activeElement!==$('asset'))$('asset').value=cur.asset;if(cur.timeframe&&document.activeElement!==$('tf'))$('tf').value=cur.timeframe;$('sent').textContent=cur.signal_sent_at?new Date(cur.signal_sent_at*1000).toLocaleTimeString([], {hour12:false}):'—';$('lock').textContent=cur.signal_lock_until?Math.max(0,Math.ceil(cur.signal_lock_until-Date.now()/1000))+'s':'—';updateClocks();$('chartmsg').textContent=cur.feed_live?'LIVE WEBSOCKET ANALYSIS':f==='STALE'?'WEBSOCKET FEED STALE':'WAITING FOR SCREEN FRAME';let fh=cur.feed_health||f;badge('feed','FEED: '+fh,fh==='LIVE'?'live':fh==='STALE'?'warn':'dead')}catch(e){badge('feed','FEED: API ERROR','dead')}}
 async function loadHistory(){try{let d=await j('/api/signals');$('hist').innerHTML=(d.signals||[]).map(x=>`<div class="hrow"><span>${x.asset}<br><small>${x.time}</small></span><b class="${x.signal==='CALL'?'green':x.signal==='PUT'?'red':''}">${x.signal} ${x.confidence}%</b></div>`).join('')||'<span class="muted">No signals yet</span>'}catch(e){}}
 init();
 </script></body></html>'''
