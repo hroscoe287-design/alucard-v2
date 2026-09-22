@@ -55,7 +55,8 @@ history = deque(maxlen=100)
 # reconnects automatically. Credentials should be supplied through Render
 # environment variables, never hard-coded into this file.
 
-PO_SSID = os.getenv("PO_SSID", "").strip()\nPOCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "")).strip()
+PO_SSID = os.getenv("PO_SSID", "").strip()
+POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "")).strip()
 POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
 POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
 POCKET_WS_RECONNECT = max(1.0, float(os.getenv("POCKET_WS_RECONNECT_SECONDS", "3")))
@@ -70,7 +71,8 @@ _ws_thread = None
 _ws_stop = threading.Event()
 _ws_messages = 0
 _ws_ticks = 0
-_ws_last_error = None\n_po_subscribed_asset = None
+_ws_last_error = None
+_po_subscribed_asset = None
 
 def _ws_json_load(value):
     if not value:
@@ -143,7 +145,8 @@ def _po_subscribe_frames():
 
 def _ws_extract(message):
     try:
-        message = _ws_decode_socketio(message)\n        obj = message if not isinstance(message, str) else json.loads(message)
+        message = _ws_decode_socketio(message)
+        obj = message if not isinstance(message, str) else json.loads(message)
     except Exception:
         return None
     if not isinstance(obj, (dict, list)):
@@ -418,7 +421,9 @@ def get_image():
             return decode(request.files[k].read(MAX_IMAGE+1))
     raw=request.get_data(cache=False,as_text=False)
     ct=(request.content_type or "").lower()
-    if raw and (ct.startswith("image/") or raw[:2]==b"\xff\xd8" or raw[:8]==b"\x89PNG\r\n\x1a\n"):
+    if raw and (ct.startswith("image/") or raw[:2]==b"\xff\xd8" or raw[:8]==b"\x89PNG\r
+\x1a
+"):
         return decode(raw)
     if request.is_json:
         d=request.get_json(silent=True) or {}
