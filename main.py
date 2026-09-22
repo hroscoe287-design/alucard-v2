@@ -1,4 +1,4 @@
-import os, io, time, base64, threading, math, json, re
+import os, io, time, base64, threading, math, json, re, encodings.idna
 from datetime import datetime, timezone
 from collections import deque
 import numpy as np
