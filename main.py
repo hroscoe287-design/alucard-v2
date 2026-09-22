@@ -275,13 +275,19 @@ def _ws_worker():
             )
 
             subscribe = _ws_json_load(POCKET_WS_SUBSCRIBE_JSON)
-            if subscribe is not None:
-                def _opened(sock):
-                    try:
+            auth_frame = _po_auth_frame()
+
+            def _opened(sock):
+                try:
+                    sock.send("40")
+                    if auth_frame:
+                        sock.send(auth_frame)
+                    if subscribe is not None:
                         sock.send(json.dumps(subscribe))
-                    except Exception as exc:
-                        _ws_error(sock, exc)
-                ws.on_open = _opened
+                except Exception as exc:
+                    _ws_error(sock, exc)
+
+            ws.on_open = _opened
 
             with lock:
                 state["feed"] = "CONNECTING"
