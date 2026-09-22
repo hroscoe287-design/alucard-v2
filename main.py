@@ -972,7 +972,19 @@ def frame():
         for k in ("asset","price","timeframe","tf","payout"):
             if request.form.get(k) is not None:metadata[k]=request.form.get(k)
     try:
-        result=analyze(arr,metadata)
+        try:
+            result=analyze(arr,metadata)
+        except ValueError as visual_exc:
+            # A portrait screenshot can contain too few reconstructable chart points.
+            # If native Pocket Option market data is already arriving, use that data
+            # for the signal engine instead of declaring the entire feed broken.
+            try:
+                with lock:
+                    ws_asset=state.get("asset") or metadata.get("asset") or "EURUSD_otc"
+                result=analyze_ws_market(ws_asset)
+                result["reason"]="Native market-data fallback • "+str(result.get("reason",""))
+            except Exception:
+                raise visual_exc
         with lock:
             state["frames"]+=1;state["analyses"]+=1;state["last_frame"]=time.time();state["last_analysis"]=time.time();state["image_received"]=True
             state["feed"]="LIVE";state["engine"]="LIVE_ANALYSIS";state["width"]=arr.shape[1];state["height"]=arr.shape[0]
