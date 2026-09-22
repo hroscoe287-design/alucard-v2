@@ -795,7 +795,8 @@ with lock:
         state["reason"] = "Waiting for Pocket Option screen feed"
         state["feed"] = "DISCONNECTED"
         state["engine"] = "WAITING_FOR_FEED"
-start_pocket_websocket()
+# Native Pocket Option Socket.IO connector is started lazily from the dashboard/API
+# after Gunicorn has completed application boot.
 # ======================= END POCKET OPTION WEBSOCKET ========================
 
 last_gray = None
@@ -1154,6 +1155,7 @@ def analyze(arr, metadata=None):
 # ----------------------------- API -----------------------------------------
 @app.get("/")
 def home():
+    start_pocket_websocket_official()
     r=app.make_response(render_template_string(HTML))
     r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
     r.headers["Pragma"]="no-cache"
