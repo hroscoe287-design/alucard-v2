@@ -72,6 +72,9 @@ _ws_stop = threading.Event()
 _ws_messages = 0
 _ws_ticks = 0
 _ws_last_error = None
+_ws_binary_frames = 0
+_ws_pending_binary = False
+_ws_auth_ok = False
 _po_subscribed_asset = None
 
 def _ws_json_load(value):
@@ -138,31 +141,49 @@ def _ws_decode_socketio(message):
     return message
 
 def _ws_decode_binary(payload):
-    # Pocket Option's updateStream is transported as a Socket.IO binary
-    # attachment. Try the common encodings used by Engine.IO/Socket.IO:
-    # UTF-8 JSON first, then a compact JSON search inside the byte payload.
+    # Pocket Option updateStream commonly arrives as a compact 39-byte
+    # binary price record. Public protocol research documents this layout:
+    # <I asset_id> <d price> <I timestamp> <f volume> <f change_24h>
+    # <f bid> <f ask> <f spread> + 3 flag bytes.
     if not payload:
         return None
+
+    # JSON/binary JSON remains supported for alternate server payloads.
     try:
-        txt=payload.decode("utf-8")
-        txt=txt.strip()
+        txt = payload.decode("utf-8").strip()
         if txt.startswith(("42","43")):
-            try: return json.loads(txt[2:])
-            except Exception: pass
-        try: return json.loads(txt)
-        except Exception: pass
-    except Exception:
-        pass
-    for enc in ("utf-8","latin1"):
+            try:
+                return json.loads(txt[2:])
+            except Exception:
+                pass
         try:
-            txt=payload.decode(enc)
-            for start in ("{","["):
-                i=txt.find(start)
-                if i>=0:
-                    try: return json.loads(txt[i:])
-                    except Exception: pass
+            return json.loads(txt)
         except Exception:
             pass
+    except Exception:
+        pass
+
+    # Native compact stream parser. The documented numeric portion is 36
+    # bytes; current frames are commonly 39 bytes including flags.
+    if len(payload) >= 36:
+        try:
+            import struct
+            asset_id, price, ts, volume, change24, bid, ask, spread = struct.unpack_from("<IdIfffff", payload, 0)
+            if math.isfinite(price) and price > 0 and math.isfinite(ts):
+                return {
+                    "_po_binary_stream": True,
+                    "asset_id": int(asset_id),
+                    "price": float(price),
+                    "timestamp": float(ts),
+                    "volume": float(volume),
+                    "change_24h": float(change24),
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "spread": float(spread),
+                }
+        except Exception:
+            pass
+
     return None
 def _po_auth_frame():
     if not PO_SSID: return None
@@ -196,6 +217,22 @@ def _ws_extract(message):
         obj = message if not isinstance(message, str) else json.loads(message)
     except Exception:
         return None
+    if isinstance(obj, dict) and obj.get("_po_binary_stream"):
+        return {
+            "asset": None,
+            "price": obj.get("price"),
+            "open": obj.get("price"),
+            "high": obj.get("price"),
+            "low": obj.get("price"),
+            "close": obj.get("price"),
+            "timestamp": obj.get("timestamp") or time.time(),
+            "asset_id": obj.get("asset_id"),
+            "volume": obj.get("volume"),
+            "change_24h": obj.get("change_24h"),
+            "bid": obj.get("bid"),
+            "ask": obj.get("ask"),
+            "spread": obj.get("spread"),
+        }
     if not isinstance(obj, (dict, list)):
         return None
 
@@ -235,6 +272,9 @@ def _ws_ingest(m):
     if price is None:
         return
 
+    # Binary updateStream records carry an asset id but not always the
+    # human-readable symbol. The selected subscription is the safe fallback;
+    # do not invent a symbol from an unknown id.
     asset = str(m.get("asset") or state.get("asset") or "EURUSD_otc")
     now = float(m.get("timestamp") or time.time())
     tf = str(state.get("timeframe") or "1m")
@@ -279,22 +319,41 @@ def _ws_headers():
     return [f"{k}: {v}" for k,v in h.items()] if isinstance(h, dict) else None
 
 def _ws_message(ws, message):
-    global _ws_messages, _ws_last_error
+    global _ws_messages, _ws_last_error, _ws_binary_frames, _ws_pending_binary
     _ws_messages += 1
     try:
-        # Text Socket.IO events.
-        m = _ws_extract(message)
-        if m:
-            _ws_ingest(m)
-            return
+        # Socket.IO binary events arrive as:
+        #   text: 451-[...{"_placeholder":true,"num":0}]
+        #   binary: the attachment bytes
+        if isinstance(message, str):
+            if message.startswith("451-") and "updateStream" in message:
+                _ws_pending_binary = True
+                with lock:
+                    state["reason"] = "Pocket Option updateStream attachment received"
+                return
+            if message.startswith("43") and "successauth" in message:
+                return
+            m = _ws_extract(message)
+            if m:
+                _ws_ingest(m)
+                return
 
-        # Pocket Option sends updateStream as a Socket.IO binary attachment.
         if isinstance(message, (bytes, bytearray)):
-            obj = _ws_decode_binary(bytes(message))
+            _ws_binary_frames += 1
+            payload = bytes(message)
+            obj = _ws_decode_binary(payload)
             if obj is not None:
                 m = _ws_extract(obj)
                 if m:
+                    _ws_pending_binary = False
                     _ws_ingest(m)
+                    return
+            # If this was an attachment we could not decode, surface its
+            # length without leaking the raw market payload.
+            if _ws_pending_binary:
+                _ws_pending_binary = False
+                with lock:
+                    state["last_error"] = "Pocket Option binary frame not decoded (bytes=%d)" % len(payload)
     except Exception as exc:
         _ws_last_error = str(exc)
         with lock:
@@ -339,41 +398,58 @@ def _ws_worker():
             auth_sent = False
             subscribe_sent = False
 
-            def _send_auth_and_subscribe(sock):
-                nonlocal auth_sent, subscribe_sent
+            def _send_auth(sock):
+                nonlocal auth_sent
                 try:
-                    # Socket.IO requires the namespace connect (40) to be
-                    # acknowledged by the server before application events
-                    # such as auth are sent. Browser captures show:
-                    #   -> 40
-                    #   <- 40{...}
-                    #   -> 42["auth", {...}]
-                    if auth_frame and not auth_sent:
+                    if not auth_frame:
+                        with lock:
+                            state["last_error"] = "Pocket Option SSID/auth is not configured"
+                        return
+                    if not auth_sent:
                         sock.send(auth_frame)
                         auth_sent = True
-                    if subscribe is not None and not subscribe_sent:
+                        with lock:
+                            state["reason"] = "Pocket Option auth sent; waiting for successauth"
+                except Exception as exc:
+                    _ws_error(sock, exc)
+
+            def _send_subscribe(sock):
+                nonlocal subscribe_sent
+                try:
+                    if subscribe_sent:
+                        return
+                    if subscribe is not None:
                         sock.send(json.dumps(subscribe))
-                        subscribe_sent = True
-                    elif auth_sent and not subscribe_sent:
+                    else:
                         for frame in _po_subscribe_frames():
                             sock.send(frame)
-                        subscribe_sent = True
+                    subscribe_sent = True
+                    with lock:
+                        state["reason"] = "Pocket Option subscription sent; waiting for updateStream"
                 except Exception as exc:
                     _ws_error(sock, exc)
 
             def _opened(sock):
                 try:
-                    # Engine.IO is already connected here. First establish the
-                    # Socket.IO namespace; wait for the server's 40 response
-                    # before sending the Pocket Option auth event.
+                    # Establish the Socket.IO namespace. Authentication is
+                    # sent only after the server acknowledges this with 40.
                     sock.send("40")
+                    with lock:
+                        state["reason"] = "Pocket Option Socket.IO namespace opened"
                 except Exception as exc:
                     _ws_error(sock, exc)
 
             def _protocol_message(sock, message):
                 try:
-                    if isinstance(message, str) and message.startswith("40"):
-                        _send_auth_and_subscribe(sock)
+                    if not isinstance(message, str):
+                        return
+                    if message.startswith("40"):
+                        _send_auth(sock)
+                        return
+                    if "successauth" in message:
+                        _send_subscribe(sock)
+                        with lock:
+                            state["reason"] = "Pocket Option authenticated; subscribed to market stream"
                 except Exception as exc:
                     _ws_error(sock, exc)
 
@@ -413,6 +489,10 @@ def start_pocket_websocket():
     _ws_thread.start()
 
 # Start automatically on Render when POCKET_WS_URL is configured.
+with lock:
+    if not PO_SSID:
+        state["last_error"] = "PO_SSID is not configured in Render"
+        state["reason"] = "Waiting for Pocket Option authentication credentials"
 start_pocket_websocket()
 # ======================= END POCKET OPTION WEBSOCKET ========================
 
