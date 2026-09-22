@@ -1,4 +1,4 @@
-import os, io, time, base64, threading, math, json, re, encodings.idna
+import os, io, time, base64, threading, math, json, re, encodings.idna, asyncio
 from datetime import datetime, timezone
 from collections import deque
 import numpy as np
@@ -504,7 +504,7 @@ def _ws_worker():
                 pass
         _ws_stop.wait(POCKET_WS_RECONNECT)
 
-def start_pocket_websocket():
+def start_pocket_websocket_official():
     global _ws_thread
     if not POCKET_WS_ENABLED or not POCKET_WS_URL or not PO_SSID:
         return
@@ -517,6 +517,265 @@ def start_pocket_websocket():
         daemon=True
     )
     _ws_thread.start()
+
+# ------------------- official Socket.IO SDK connector -------------------
+try:
+    from pocket_option import PocketOptionClient as _OfficialPOClient
+    from pocket_option.constants import Regions as _PORegions
+    from pocket_option.models import Asset as _POAsset
+    from pocket_option.models import AuthorizationData as _POAuthorization
+    _official_po_available = True
+except Exception as _official_po_import_error:
+    _OfficialPOClient = None
+    _PORegions = None
+    _POAsset = None
+    _POAuthorization = None
+    _official_po_available = False
+
+_official_po_thread = None
+_official_po_stop = threading.Event()
+_official_po_connected = False
+_official_po_authorized = False
+_official_po_error = None
+
+def _po_parse_authorization():
+    if not PO_SSID:
+        return None
+    raw = PO_SSID.strip()
+    obj = None
+    try:
+        if raw.startswith("42"):
+            packet = json.loads(raw[2:])
+            if isinstance(packet, list) and len(packet) >= 2 and packet[0] == "auth":
+                obj = packet[1]
+        elif raw.startswith("{"):
+            obj = json.loads(raw)
+    except Exception:
+        obj = None
+    if not isinstance(obj, dict):
+        obj = {
+            "session": raw,
+            "isDemo": int(os.getenv("PO_IS_DEMO", "0")),
+            "uid": int(os.getenv("PO_UID", "0") or 0),
+            "platform": int(os.getenv("PO_PLATFORM", "2") or 2),
+        }
+    obj = dict(obj)
+    obj["session"] = str(obj.get("session") or raw)
+    obj["isDemo"] = 1 if int(obj.get("isDemo", 0) or 0) else 0
+    obj["uid"] = int(obj.get("uid", os.getenv("PO_UID", "0") or 0) or 0)
+    obj["platform"] = int(obj.get("platform", os.getenv("PO_PLATFORM", "2") or 2) or 2)
+    obj["isFastHistory"] = True
+    obj["isOptimized"] = True
+    return obj
+
+def _po_base_url(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "/socket.io" in raw:
+        raw = raw.split("/socket.io", 1)[0]
+    return raw.rstrip("/")
+
+def _official_po_regions(auth):
+    explicit = _po_base_url(POCKET_WS_URL)
+    if explicit:
+        return [explicit]
+    if bool(auth.get("isDemo")):
+        return [str(_PORegions.DEMO), str(_PORegions.DEMO_2)]
+    return [
+        str(_PORegions.EUROPA),
+        str(_PORegions.UNITED_STATES_SOUTH),
+        str(_PORegions.UNITED_STATES_NORTH),
+        str(_PORegions.ASIA),
+        str(_PORegions.RUSSIA),
+        str(_PORegions.INDIA),
+    ]
+
+def _po_plain_data(value):
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(by_alias=True, mode="json")
+        except Exception:
+            return value.model_dump()
+    return value
+
+async def _official_po_async():
+    global _official_po_connected, _official_po_authorized, _official_po_error, _ws_thread, _ws_messages
+    if not _official_po_available:
+        with lock:
+            state["last_error"] = "Pocket Option SDK failed to import: " + str(_official_po_import_error)
+            state["reason"] = "Native Socket.IO SDK unavailable"
+        return
+    auth = _po_parse_authorization()
+    if not auth:
+        with lock:
+            state["reason"] = "Waiting for Pocket Option SSID/auth"
+        return
+    try:
+        authorization = _POAuthorization.model_validate(auth)
+    except Exception as exc:
+        with lock:
+            state["last_error"] = "Invalid Pocket Option SSID/auth payload: " + str(exc)
+            state["reason"] = "SSID payload could not be parsed"
+        return
+
+    client = None
+    try:
+        client = _OfficialPOClient(
+            logger=False,
+            socketio_logger=False,
+            engineio_logger=False,
+            reconnection=True,
+            reconnection_attempts=0,
+            reconnection_delay=1,
+            reconnection_delay_max=5,
+            websocket_extra_options={"origin": "https://m.pocketoption.com"},
+        )
+
+        async def on_connect():
+            global _official_po_connected
+            _official_po_connected = True
+            with lock:
+                state["feed"] = "CONNECTING"
+                state["engine"] = "WAITING_FOR_FEED"
+                state["reason"] = "Pocket Option Socket.IO connected; authenticating"
+
+        async def on_disconnect():
+            global _official_po_connected, _official_po_authorized
+            _official_po_connected = False
+            _official_po_authorized = False
+            with lock:
+                if state.get("feed") != "LIVE":
+                    state["feed"] = "DISCONNECTED"
+                    state["engine"] = "WAITING_FOR_FEED"
+                state["reason"] = "Pocket Option Socket.IO disconnected; reconnecting"
+
+        async def on_auth(_data=None):
+            global _official_po_authorized
+            _official_po_authorized = True
+            with lock:
+                state["reason"] = "Pocket Option authenticated; market subscription active"
+                state["last_error"] = None
+
+        async def on_stream(data=None):
+            global _ws_messages
+            _ws_messages += 1
+            items = data if isinstance(data, list) else [data]
+            for raw_item in items:
+                item = _po_plain_data(raw_item)
+                if not isinstance(item, dict):
+                    continue
+                asset = str(item.get("asset") or state.get("asset") or "EURUSD_otc")
+                price = _ws_num(item.get("value"))
+                if price is None:
+                    price = _ws_num(item.get("price") or item.get("close"))
+                if price is None:
+                    continue
+                ts = _ws_num(item.get("timestamp")) or time.time()
+                _ws_ingest({"asset":asset,"price":price,"open":price,"high":price,"low":price,"close":price,"timestamp":ts})
+
+        async def on_history(data=None):
+            global _ws_messages
+            _ws_messages += 1
+            payload = _po_plain_data(data)
+            if not isinstance(payload, dict):
+                return
+            asset = str(payload.get("asset") or state.get("asset") or "EURUSD_otc")
+            period = int(payload.get("period") or TIMEFRAMES.get(str(state.get("timeframe") or "1m"), 60))
+            rows = payload.get("history") or []
+            series = state.setdefault("_ws_prices", {})
+            key = f"{asset}:{period}"
+            buf = series.setdefault(key, deque(maxlen=5000))
+            for row in rows:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                nums = [_ws_num(x) for x in row]
+                nums = [x for x in nums if x is not None and x > 0]
+                if nums:
+                    prices = nums[-4:] if len(nums) >= 4 else nums[-1:]
+                    buf.extend(prices)
+            if len(buf) >= 20:
+                with lock:
+                    state["feed"] = "LIVE"
+                    state["engine"] = "ANALYZING"
+                    state["reason"] = "Pocket Option historical market data received"
+                    state["last_frame"] = time.time()
+
+        client.add_on("updateStream", on_stream)
+        client.add_on("updateHistoryNewFast", on_history)
+        client.add_on("successauth", on_auth)
+        client.add_on("disconnect", on_disconnect)
+
+        regions = _official_po_regions(auth)
+        while not _official_po_stop.is_set():
+            for region in regions:
+                if _official_po_stop.is_set():
+                    break
+                try:
+                    with lock:
+                        state["feed"] = "CONNECTING"
+                        state["engine"] = "WAITING_FOR_FEED"
+                        state["reason"] = "Connecting to Pocket Option " + region
+                    await client.connect(region, headers={"Origin":"https://m.pocketoption.com","User-Agent":"Mozilla/5.0"}, wait=True, wait_timeout=15, retry=False)
+                    _official_po_connected = True
+                    _ws_thread = _official_po_thread
+                    await client.emit.auth(authorization)
+                    asset_name = str(state.get("asset") or "EURUSD_otc")
+                    period = int(TIMEFRAMES.get(str(state.get("timeframe") or "1m"), 60))
+                    asset = _POAsset(asset_name)
+                    await client.emit.subscribe_to_asset(asset)
+                    await client.emit.change_asset({"asset":asset,"period":period})
+                    await client.emit.subscribe_for_market_sentiment(asset)
+                    with lock:
+                        state["reason"] = "Pocket Option authenticated; subscribed to updateStream/updateHistoryNewFast"
+                    await client.wait()
+                except Exception as exc:
+                    _official_po_connected = False
+                    _official_po_authorized = False
+                    with lock:
+                        state["last_error"] = "Pocket Option SDK: " + str(exc)
+                        state["reason"] = "Pocket Option connection retry"
+                finally:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                if not _official_po_stop.is_set():
+                    await asyncio.sleep(1.5)
+            if not _official_po_stop.is_set():
+                await asyncio.sleep(2)
+    except Exception as exc:
+        _official_po_error = str(exc)
+        with lock:
+            state["last_error"] = "Pocket Option SDK worker: " + str(exc)
+    finally:
+        try:
+            if client is not None:
+                await client.disconnect()
+        except Exception:
+            pass
+        _official_po_connected = False
+        _official_po_authorized = False
+
+def _official_po_worker():
+    try:
+        asyncio.run(_official_po_async())
+    except Exception as exc:
+        global _official_po_error
+        _official_po_error = str(exc)
+        with lock:
+            state["last_error"] = "Pocket Option SDK thread: " + str(exc)
+
+def start_pocket_websocket_official():
+    global _official_po_thread, _ws_thread
+    if not POCKET_WS_ENABLED or not PO_SSID:
+        return
+    if _official_po_thread and _official_po_thread.is_alive():
+        return
+    _official_po_stop.clear()
+    _official_po_thread = threading.Thread(target=_official_po_worker, name="alucard-pocket-option-socketio", daemon=True)
+    _ws_thread = _official_po_thread
+    _official_po_thread.start()
 
 # Start automatically on Render when POCKET_WS_URL is configured.
 with lock:
