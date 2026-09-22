@@ -869,7 +869,9 @@ def health():
 @app.get("/api/state")
 def api_state():
     with lock:
-        d=dict(state)
+        # Never serialize internal live-stream buffers (deques/locks) into the API.
+        # They are engine state only and can make Flask jsonify fail or stall the dashboard.
+        d={k:v for k,v in state.items() if not str(k).startswith("_")}
     d["feed_age"]=age();d["feed_live"]=d["feed_age"] is not None and d["feed_age"]<=STALE and d["frames"]>0;d["feed_health"]="LIVE" if d["feed_live"] else ("STALE" if d["feed_age"] is not None else "WAITING")
     return jsonify(d)
 @app.get("/api/assets")
