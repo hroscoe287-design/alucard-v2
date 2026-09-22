@@ -56,7 +56,7 @@ history = deque(maxlen=100)
 # environment variables, never hard-coded into this file.
 
 PO_SSID = os.getenv("PO_SSID", "").strip()
-POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "")).strip()
+POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "wss://api-spb.po.market/socket.io/?EIO=4&transport=websocket")).strip()
 POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
 POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
 POCKET_WS_RECONNECT = max(1.0, float(os.getenv("POCKET_WS_RECONNECT_SECONDS", "3")))
@@ -181,7 +181,7 @@ def _po_auth_frame():
         "session":s,
         "isDemo":int(os.getenv("PO_IS_DEMO","0")),
         "uid":int(os.getenv("PO_UID","0")) if os.getenv("PO_UID") else 0,
-        "platform":int(os.getenv("PO_PLATFORM","9")),
+        "platform":int(os.getenv("PO_PLATFORM","2")),
         "isFastHistory":True,
         "isOptimized":True
     }],separators=(",",":"))
