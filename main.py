@@ -778,7 +778,7 @@ def commit_signal(result):
         state["entry_window"]=0
         return "WAIT",float(result["confidence"]),False
 
-@def analyze_ws_market(asset=None):
+def analyze_ws_market(asset=None):
     asset=str(asset or state.get("asset") or "EURUSD_otc"); tf=str(state.get("timeframe") or "1m"); seconds=int(TIMEFRAMES.get(tf,60))
     series=state.get("_ws_prices",{}).get(f"{asset}:{seconds}")
     if not series or len(series)<40: raise ValueError("waiting for enough WebSocket market history")
