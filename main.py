@@ -861,7 +861,11 @@ def analyze(arr, metadata=None):
 
 # ----------------------------- API -----------------------------------------
 @app.get("/")
-def home(): return render_template_string(HTML)
+def home():
+    r=app.make_response(render_template_string(HTML))
+    r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    r.headers["Pragma"]="no-cache"
+    return r
 @app.get("/api/health")
 def health():
     a=age()
@@ -873,7 +877,9 @@ def api_state():
         # They are engine state only and can make Flask jsonify fail or stall the dashboard.
         d={k:v for k,v in state.items() if not str(k).startswith("_")}
     d["feed_age"]=age();d["feed_live"]=d["feed_age"] is not None and d["feed_age"]<=STALE and d["frames"]>0;d["feed_health"]="LIVE" if d["feed_live"] else ("STALE" if d["feed_age"] is not None else "WAITING")
-    return jsonify(d)
+    r=jsonify(d)
+    r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    return r
 @app.get("/api/assets")
 def assets(): return jsonify({"groups":GROUPS,"all":sorted(ALL_ASSETS)})
 @app.get("/api/timeframes")
