@@ -519,18 +519,14 @@ def start_pocket_websocket_official():
     _ws_thread.start()
 
 # ------------------- official Socket.IO SDK connector -------------------
-try:
-    from pocket_option import PocketOptionClient as _OfficialPOClient
-    from pocket_option.constants import Regions as _PORegions
-    from pocket_option.models import Asset as _POAsset
-    from pocket_option.models import AuthorizationData as _POAuthorization
-    _official_po_available = True
-except Exception as _official_po_import_error:
-    _OfficialPOClient = None
-    _PORegions = None
-    _POAsset = None
-    _POAuthorization = None
-    _official_po_available = False
+# Imports are lazy so a third-party SDK problem can never prevent Flask/Gunicorn
+# from booting. The connector runs in its own asyncio thread.
+_official_po_available = None
+_OfficialPOClient = None
+_PORegions = None
+_POAsset = None
+_POAuthorization = None
+_official_po_import_error = None
 
 _official_po_thread = None
 _official_po_stop = threading.Event()
@@ -601,6 +597,21 @@ def _po_plain_data(value):
 
 async def _official_po_async():
     global _official_po_connected, _official_po_authorized, _official_po_error, _ws_thread, _ws_messages
+    global _official_po_available, _OfficialPOClient, _PORegions, _POAsset, _POAuthorization, _official_po_import_error
+    if _official_po_available is None:
+        try:
+            from pocket_option import PocketOptionClient as _ImportedPOClient
+            from pocket_option.constants import Regions as _ImportedPORegions
+            from pocket_option.models import Asset as _ImportedPOAsset
+            from pocket_option.models import AuthorizationData as _ImportedPOAuthorization
+            _OfficialPOClient = _ImportedPOClient
+            _PORegions = _ImportedPORegions
+            _POAsset = _ImportedPOAsset
+            _POAuthorization = _ImportedPOAuthorization
+            _official_po_available = True
+        except Exception as exc:
+            _official_po_import_error = exc
+            _official_po_available = False
     if not _official_po_available:
         with lock:
             state["last_error"] = "Pocket Option SDK failed to import: " + str(_official_po_import_error)
