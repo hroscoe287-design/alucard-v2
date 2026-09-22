@@ -56,7 +56,23 @@ history = deque(maxlen=100)
 # environment variables, never hard-coded into this file.
 
 PO_SSID = next((os.getenv(k, "").strip() for k in ("PO_SSID","POCKET_OPTION_SSID","POCKET_OPTION_SESSION","PO_SESSION","PO_SSID_TOKEN","PO_TOKEN","SSID") if os.getenv(k, "").strip()), "")
-POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "wss://api-spb.po.market/socket.io/?EIO=4&transport=websocket")).strip()
+POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "")).strip()
+# Pocket Option uses region-specific Socket.IO clusters.  If no explicit
+# endpoint is supplied, try the US clusters first, then the common EU/SPB
+# clusters instead of locking the adapter to one region.
+POCKET_WS_URLS = [
+    x.strip() for x in os.getenv(
+        "POCKET_WS_URLS",
+        ",".join([
+            POCKET_WS_URL,
+            "wss://api-us-south.po.market/socket.io/?EIO=4&transport=websocket",
+            "wss://api-us-north.po.market/socket.io/?EIO=4&transport=websocket",
+            "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket",
+            "wss://api-spb.po.market/socket.io/?EIO=4&transport=websocket",
+        ])
+    ).split(",") if x.strip()
+]
+POCKET_WS_URL = POCKET_WS_URLS[0] if POCKET_WS_URLS else ""
 POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
 POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
 POCKET_WS_RECONNECT = max(1.0, float(os.getenv("POCKET_WS_RECONNECT_SECONDS", "3")))
@@ -203,7 +219,7 @@ def _po_auth_frame():
         "session":s,
         "isDemo":int(os.getenv("PO_IS_DEMO","0")),
         "uid":int(os.getenv("PO_UID","0")) if os.getenv("PO_UID") else 0,
-        "platform":int(os.getenv("PO_PLATFORM","9")),
+        "platform":int(os.getenv("PO_PLATFORM","2")),
         "isFastHistory":True,
         "isOptimized":True
     }],separators=(",",":"))
@@ -382,19 +398,25 @@ def _ws_close(ws, code, msg):
 def _ws_worker():
     if not POCKET_WS_ENABLED:
         return
-    if not POCKET_WS_URL:
+    if not POCKET_WS_URLS:
         with lock:
-            state["last_error"] = "POCKET_WS_URL is not configured"
+            state["last_error"] = "No Pocket Option WebSocket endpoint is configured"
         return
     if _ws_client is None:
         with lock:
             state["last_error"] = "websocket-client is not installed"
         return
 
+    region_index = 0
     while not _ws_stop.is_set():
+        ws = None
         try:
+            region_url = POCKET_WS_URLS[region_index % len(POCKET_WS_URLS)]
+            region_index += 1
+            with lock:
+                state["reason"] = "Connecting to Pocket Option region " + region_url.split("//",1)[-1].split("/",1)[0]
             ws = _ws_client.WebSocketApp(
-                POCKET_WS_URL,
+                region_url,
                 header=_ws_headers(),
                 on_message=_ws_message,
                 on_error=_ws_error,
