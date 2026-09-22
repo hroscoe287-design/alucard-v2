@@ -61,6 +61,7 @@ POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
 POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
 POCKET_WS_RECONNECT = max(1.0, float(os.getenv("POCKET_WS_RECONNECT_SECONDS", "3")))
 POCKET_WS_ENABLED = os.getenv("POCKET_WS_ENABLED", "1").lower() not in {"0","false","no","off"}
+POCKET_WS_CONFIGURED = bool(PO_SSID)
 
 try:
     import websocket as _ws_client
@@ -483,7 +484,7 @@ def _ws_worker():
 
 def start_pocket_websocket():
     global _ws_thread
-    if not POCKET_WS_ENABLED or not POCKET_WS_URL:
+    if not POCKET_WS_ENABLED or not POCKET_WS_URL or not PO_SSID:
         return
     if _ws_thread and _ws_thread.is_alive():
         return
@@ -498,8 +499,10 @@ def start_pocket_websocket():
 # Start automatically on Render when POCKET_WS_URL is configured.
 with lock:
     if not PO_SSID:
-        state["last_error"] = "PO_SSID is not configured in Render"
-        state["reason"] = "Waiting for Pocket Option authentication credentials"
+        state["last_error"] = None
+        state["reason"] = "Waiting for Pocket Option screen feed"
+        state["feed"] = "DISCONNECTED"
+        state["engine"] = "WAITING_FOR_FEED"
 start_pocket_websocket()
 # ======================= END POCKET OPTION WEBSOCKET ========================
 
@@ -945,7 +948,7 @@ def analyze_ws_market(asset=None):
 def websocket_signal_worker():
     while True:
         time.sleep(1)
-        if not POCKET_WS_ENABLED or not POCKET_WS_URL: continue
+        if not POCKET_WS_ENABLED or not POCKET_WS_URL or not PO_SSID: continue
         try:
             with lock: asset=state.get("asset") or "EURUSD_otc"
             result=analyze_ws_market(asset)
