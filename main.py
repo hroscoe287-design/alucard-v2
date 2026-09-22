@@ -421,9 +421,7 @@ def get_image():
             return decode(request.files[k].read(MAX_IMAGE+1))
     raw=request.get_data(cache=False,as_text=False)
     ct=(request.content_type or "").lower()
-    if raw and (ct.startswith("image/") or raw[:2]==b"\xff\xd8" or raw[:8]==b"\x89PNG\r
-\x1a
-"):
+    if raw and (ct.startswith("image/") or raw[:2]==b"\xff\xd8" or raw[:8]==b"\x89PNG\r\n\x1a\n"):
         return decode(raw)
     if request.is_json:
         d=request.get_json(silent=True) or {}
