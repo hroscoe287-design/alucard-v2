@@ -1036,7 +1036,7 @@ def feed_compat():
                     state["signal_lock_until"]=now+max(ENTRY_SECONDS,int(TIMEFRAMES.get(state["timeframe"],60)*SIGNAL_LOCK_FRACTION));state["signal_id"]+=1;state["entry_window"]=ENTRY_SECONDS
             except Exception: pass
         state["feed"]="LIVE";state["last_frame"]=time.time();state["image_received"]=False;state["engine"]="JSON_FEED"
-    return jsonify(ok=True,message="JSON feed accepted",state=dict(state))
+    return jsonify(ok=True,message="JSON feed accepted",asset=state.get("asset"),timeframe=state.get("timeframe"),price=state.get("price"),signal=state.get("signal"),confidence=state.get("confidence"))
 
 # ----------------------------- watchdog ------------------------------------
 def watchdog():
