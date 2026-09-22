@@ -276,18 +276,53 @@ def _ws_worker():
 
             subscribe = _ws_json_load(POCKET_WS_SUBSCRIBE_JSON)
             auth_frame = _po_auth_frame()
+            auth_sent = False
+            subscribe_sent = False
+
+            def _send_auth_and_subscribe(sock):
+                nonlocal auth_sent, subscribe_sent
+                try:
+                    # Socket.IO requires the namespace connect (40) to be
+                    # acknowledged by the server before application events
+                    # such as auth are sent. Browser captures show:
+                    #   -> 40
+                    #   <- 40{...}
+                    #   -> 42["auth", {...}]
+                    if auth_frame and not auth_sent:
+                        sock.send(auth_frame)
+                        auth_sent = True
+                    if subscribe is not None and not subscribe_sent:
+                        sock.send(json.dumps(subscribe))
+                        subscribe_sent = True
+                    elif auth_sent and not subscribe_sent:
+                        for frame in _po_subscribe_frames():
+                            sock.send(frame)
+                        subscribe_sent = True
+                except Exception as exc:
+                    _ws_error(sock, exc)
 
             def _opened(sock):
                 try:
+                    # Engine.IO is already connected here. First establish the
+                    # Socket.IO namespace; wait for the server's 40 response
+                    # before sending the Pocket Option auth event.
                     sock.send("40")
-                    if auth_frame:
-                        sock.send(auth_frame)
-                    if subscribe is not None:
-                        sock.send(json.dumps(subscribe))
+                except Exception as exc:
+                    _ws_error(sock, exc)
+
+            def _protocol_message(sock, message):
+                try:
+                    if isinstance(message, str) and message.startswith("40"):
+                        _send_auth_and_subscribe(sock)
                 except Exception as exc:
                     _ws_error(sock, exc)
 
             ws.on_open = _opened
+            original_on_message = ws.on_message
+            def _on_message(sock, message):
+                _protocol_message(sock, message)
+                _ws_message(sock, message)
+            ws.on_message = _on_message
 
             with lock:
                 state["feed"] = "CONNECTING"
