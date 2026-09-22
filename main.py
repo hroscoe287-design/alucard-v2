@@ -55,7 +55,7 @@ history = deque(maxlen=100)
 # reconnects automatically. Credentials should be supplied through Render
 # environment variables, never hard-coded into this file.
 
-PO_SSID = os.getenv("PO_SSID", "").strip()
+PO_SSID = next((os.getenv(k, "").strip() for k in ("PO_SSID","POCKET_OPTION_SSID","POCKET_OPTION_SESSION","PO_SESSION","PO_SSID_TOKEN","PO_TOKEN","SSID") if os.getenv(k, "").strip()), "")
 POCKET_WS_URL = os.getenv("POCKET_WS_URL", os.getenv("PO_WS_URL", "wss://api-spb.po.market/socket.io/?EIO=4&transport=websocket")).strip()
 POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
 POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
