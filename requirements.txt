@@ -3,4 +3,5 @@ numpy>=2.0,<3
 Pillow>=10,<13
 opencv-python-headless>=4.8,<5
 gunicorn>=22,<24
+websocket-client>=1.8,<2
 
