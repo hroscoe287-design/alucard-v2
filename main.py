@@ -124,20 +124,67 @@ def _ws_text(obj, names):
     return None
 
 def _ws_decode_socketio(message):
+    if isinstance(message, (bytes, bytearray)):
+        return _ws_decode_binary(bytes(message))
     if not isinstance(message,str): return message
     if message.startswith("42"):
         try: return json.loads(message[2:])
         except Exception: return message
+    if message.startswith("451-"):
+        # Socket.IO binary-event envelope. The actual payload arrives in a
+        # following binary WebSocket frame; websocket-client delivers that
+        # frame separately, so keep the envelope for attachment correlation.
+        return message
     return message
+
+def _ws_decode_binary(payload):
+    # Pocket Option's updateStream is transported as a Socket.IO binary
+    # attachment. Try the common encodings used by Engine.IO/Socket.IO:
+    # UTF-8 JSON first, then a compact JSON search inside the byte payload.
+    if not payload:
+        return None
+    try:
+        txt=payload.decode("utf-8")
+        txt=txt.strip()
+        if txt.startswith(("42","43")):
+            try: return json.loads(txt[2:])
+            except Exception: pass
+        try: return json.loads(txt)
+        except Exception: pass
+    except Exception:
+        pass
+    for enc in ("utf-8","latin1"):
+        try:
+            txt=payload.decode(enc)
+            for start in ("{","["):
+                i=txt.find(start)
+                if i>=0:
+                    try: return json.loads(txt[i:])
+                    except Exception: pass
+        except Exception:
+            pass
+    return None
 def _po_auth_frame():
     if not PO_SSID: return None
     s=PO_SSID.strip()
-    if s.startswith("42"): return s
+    if s.startswith("42"):
+        return s
     try:
         obj=json.loads(s)
-        if isinstance(obj,dict): return "42"+json.dumps(["auth",obj],separators=(",",":"))
-    except Exception: pass
-    return None
+        if isinstance(obj,dict):
+            return "42"+json.dumps(["auth",obj],separators=(",",":"))
+    except Exception:
+        pass
+    # Accept the raw Pocket Option session value stored in PO_SSID.
+    # The browser auth event supplies the session string plus account flags.
+    return "42"+json.dumps(["auth",{
+        "session":s,
+        "isDemo":int(os.getenv("PO_IS_DEMO","0")),
+        "uid":int(os.getenv("PO_UID","0")) if os.getenv("PO_UID") else 0,
+        "platform":int(os.getenv("PO_PLATFORM","9")),
+        "isFastHistory":True,
+        "isOptimized":True
+    }],separators=(",",":"))
 def _po_subscribe_frames():
     asset=str(state.get("asset") or "EURUSD_otc")
     period=int(TIMEFRAMES.get(str(state.get("timeframe") or "1m"),60))
@@ -235,9 +282,19 @@ def _ws_message(ws, message):
     global _ws_messages, _ws_last_error
     _ws_messages += 1
     try:
+        # Text Socket.IO events.
         m = _ws_extract(message)
         if m:
             _ws_ingest(m)
+            return
+
+        # Pocket Option sends updateStream as a Socket.IO binary attachment.
+        if isinstance(message, (bytes, bytearray)):
+            obj = _ws_decode_binary(bytes(message))
+            if obj is not None:
+                m = _ws_extract(obj)
+                if m:
+                    _ws_ingest(m)
     except Exception as exc:
         _ws_last_error = str(exc)
         with lock:
