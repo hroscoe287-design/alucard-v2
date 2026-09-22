@@ -985,7 +985,14 @@ def websocket_signal_worker():
             with lock: state["last_error"]=str(exc)
 threading.Thread(target=websocket_signal_worker,name="alucard-ws-engine",daemon=True).start()
 
-app.post("/api/frame")
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-ALUCARD-TOKEN"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.post("/api/frame")
 def frame():
     if not auth():return jsonify(ok=False,error="Unauthorized"),401
     try: im,arr=get_image()
