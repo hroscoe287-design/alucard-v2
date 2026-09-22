@@ -44,6 +44,257 @@ state = {
 }
 lock = threading.RLock()
 history = deque(maxlen=100)
+
+
+# ========================= POCKET OPTION WEBSOCKET =========================
+# Direct WebSocket market-data adapter. Screen Stream is no longer required
+# when POCKET_WS_URL points at the user's existing Pocket Option WebSocket.
+#
+# The endpoint/auth/subscription protocol is intentionally configurable rather
+# than fabricated. This adapter accepts common JSON tick/OHLC field names and
+# reconnects automatically. Credentials should be supplied through Render
+# environment variables, never hard-coded into this file.
+
+POCKET_WS_URL = os.getenv("POCKET_WS_URL", "").strip()
+POCKET_WS_HEADERS_JSON = os.getenv("POCKET_WS_HEADERS_JSON", "").strip()
+POCKET_WS_SUBSCRIBE_JSON = os.getenv("POCKET_WS_SUBSCRIBE_JSON", "").strip()
+POCKET_WS_RECONNECT = max(1.0, float(os.getenv("POCKET_WS_RECONNECT_SECONDS", "3")))
+POCKET_WS_ENABLED = os.getenv("POCKET_WS_ENABLED", "1").lower() not in {"0","false","no","off"}
+
+try:
+    import websocket as _ws_client
+except Exception:
+    _ws_client = None
+
+_ws_thread = None
+_ws_stop = threading.Event()
+_ws_messages = 0
+_ws_ticks = 0
+_ws_last_error = None
+
+def _ws_json_load(value):
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+def _ws_num(v):
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", v.replace(",", ""))
+        return float(m.group(0)) if m else None
+    return None
+
+def _ws_walk(obj, depth=0):
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _ws_walk(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj[:100]:
+            yield from _ws_walk(v, depth + 1)
+
+def _ws_value(obj, names):
+    wanted = {str(x).lower() for x in names}
+    for d in _ws_walk(obj):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if str(k).lower() in wanted:
+                    n = _ws_num(v)
+                    if n is not None:
+                        return n
+    return None
+
+def _ws_text(obj, names):
+    wanted = {str(x).lower() for x in names}
+    for d in _ws_walk(obj):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if str(k).lower() in wanted and isinstance(v, str) and v.strip():
+                    return v.strip()
+    return None
+
+def _ws_extract(message):
+    try:
+        obj = json.loads(message) if isinstance(message, str) else message
+    except Exception:
+        return None
+    if not isinstance(obj, (dict, list)):
+        return None
+
+    for d in _ws_walk(obj):
+        if not isinstance(d, dict):
+            continue
+        close = _ws_num(d.get("close"))
+        if close is not None:
+            return {
+                "asset": d.get("asset") or d.get("symbol") or d.get("pair") or d.get("instrument"),
+                "price": close,
+                "open": _ws_num(d.get("open")) or close,
+                "high": _ws_num(d.get("high")) or close,
+                "low": _ws_num(d.get("low")) or close,
+                "close": close,
+                "timestamp": _ws_value(d, ("timestamp","time","ts")) or time.time()
+            }
+
+    price = _ws_value(obj, ("price","last","rate","quote","value","bid","ask","close"))
+    if price is None:
+        return None
+    return {
+        "asset": _ws_text(obj, ("asset","symbol","pair","instrument","active","name")),
+        "price": price,
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "timestamp": _ws_value(obj, ("timestamp","time","ts")) or time.time()
+    }
+
+_ws_candles = {}
+
+def _ws_ingest(m):
+    global _ws_ticks
+    price = _ws_num(m.get("price"))
+    if price is None:
+        return
+
+    asset = str(m.get("asset") or state.get("asset") or "EURUSD_otc")
+    now = float(m.get("timestamp") or time.time())
+    tf = str(state.get("timeframe") or "1m")
+    seconds = int(TIMEFRAMES.get(tf, 60))
+    bucket = int(now // seconds) * seconds
+    key = (asset, seconds, bucket)
+
+    candle = _ws_candles.get(key)
+    if candle is None:
+        candle = {"open":price, "high":price, "low":price, "close":price, "time":bucket}
+        _ws_candles[key] = candle
+    else:
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+
+    # Feed the existing Alucard state without requiring a screenshot.
+    with lock:
+        state["feed"] = "LIVE"
+        state["engine"] = "ANALYZING"
+        state["price"] = price
+        state["asset"] = asset
+        state["last_frame"] = time.time()
+        state["frames"] = int(state.get("frames") or 0) + 1
+        state["image_received"] = False
+        state["width"] = 0
+        state["height"] = 0
+        state["reason"] = "Pocket Option WebSocket market data"
+        state["last_error"] = None
+
+    _ws_ticks += 1
+
+    # Keep a rolling market-data series for future/native WebSocket analysis.
+    series = state.setdefault("_ws_prices", {})
+    key2 = f"{asset}:{seconds}"
+    if key2 not in series:
+        series[key2] = deque(maxlen=5000)
+    series[key2].append(price)
+
+def _ws_headers():
+    h = _ws_json_load(POCKET_WS_HEADERS_JSON)
+    return [f"{k}: {v}" for k,v in h.items()] if isinstance(h, dict) else None
+
+def _ws_message(ws, message):
+    global _ws_messages, _ws_last_error
+    _ws_messages += 1
+    try:
+        m = _ws_extract(message)
+        if m:
+            _ws_ingest(m)
+    except Exception as exc:
+        _ws_last_error = str(exc)
+        with lock:
+            state["last_error"] = "WebSocket parser: " + str(exc)
+
+def _ws_error(ws, error):
+    global _ws_last_error
+    _ws_last_error = str(error)
+    with lock:
+        state["last_error"] = "WebSocket: " + str(error)
+
+def _ws_close(ws, code, msg):
+    with lock:
+        if state.get("feed") != "LIVE":
+            state["feed"] = "DISCONNECTED"
+            state["engine"] = "WAITING_FOR_FEED"
+
+def _ws_worker():
+    if not POCKET_WS_ENABLED:
+        return
+    if not POCKET_WS_URL:
+        with lock:
+            state["last_error"] = "POCKET_WS_URL is not configured"
+        return
+    if _ws_client is None:
+        with lock:
+            state["last_error"] = "websocket-client is not installed"
+        return
+
+    while not _ws_stop.is_set():
+        try:
+            ws = _ws_client.WebSocketApp(
+                POCKET_WS_URL,
+                header=_ws_headers(),
+                on_message=_ws_message,
+                on_error=_ws_error,
+                on_close=_ws_close,
+            )
+
+            subscribe = _ws_json_load(POCKET_WS_SUBSCRIBE_JSON)
+            if subscribe is not None:
+                def _opened(sock):
+                    try:
+                        sock.send(json.dumps(subscribe))
+                    except Exception as exc:
+                        _ws_error(sock, exc)
+                ws.on_open = _opened
+
+            with lock:
+                state["feed"] = "CONNECTING"
+                state["engine"] = "WAITING_FOR_FEED"
+
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as exc:
+            _ws_error(None, exc)
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        _ws_stop.wait(POCKET_WS_RECONNECT)
+
+def start_pocket_websocket():
+    global _ws_thread
+    if not POCKET_WS_ENABLED or not POCKET_WS_URL:
+        return
+    if _ws_thread and _ws_thread.is_alive():
+        return
+    _ws_stop.clear()
+    _ws_thread = threading.Thread(
+        target=_ws_worker,
+        name="alucard-pocket-option-websocket",
+        daemon=True
+    )
+    _ws_thread.start()
+
+# Start automatically on Render when POCKET_WS_URL is configured.
+start_pocket_websocket()
+# ======================= END POCKET OPTION WEBSOCKET ========================
+
 last_gray = None
 last_frame_arr = None
 
