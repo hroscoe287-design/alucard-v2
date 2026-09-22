@@ -202,14 +202,21 @@ def _po_auth_frame():
         "session":s,
         "isDemo":int(os.getenv("PO_IS_DEMO","0")),
         "uid":int(os.getenv("PO_UID","0")) if os.getenv("PO_UID") else 0,
-        "platform":int(os.getenv("PO_PLATFORM","2")),
+        "platform":int(os.getenv("PO_PLATFORM","9")),
         "isFastHistory":True,
         "isOptimized":True
     }],separators=(",",":"))
 def _po_subscribe_frames():
     asset=str(state.get("asset") or "EURUSD_otc")
     period=int(TIMEFRAMES.get(str(state.get("timeframe") or "1m"),60))
-    return ["42"+json.dumps(["subscribeSymbol",{"asset":asset}],separators=(",",":")),"42"+json.dumps(["changeSymbol",{"asset":asset,"period":period}],separators=(",",":")),"42"+json.dumps(["subfor",asset],separators=(",",":"))]
+    return [
+        "42"+json.dumps(["ps"],separators=(",",":")),
+        "42"+json.dumps(["loadHistoryPeriod",{"asset":asset,"index":int(time.time()),"time":int(time.time())-600,"offset":9000,"period":period}],separators=(",",":")),
+        "42"+json.dumps(["loadHistoryPeriodFast",{"asset":asset,"period":period}],separators=(",",":")),
+        "42"+json.dumps(["subscribeSymbol",{"asset":asset}],separators=(",",":")),
+        "42"+json.dumps(["changeSymbol",{"asset":asset,"period":period}],separators=(",",":")),
+        "42"+json.dumps(["subfor",asset],separators=(",",":"))
+    ]
 
 def _ws_extract(message):
     try:
