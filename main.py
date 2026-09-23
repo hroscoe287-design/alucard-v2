@@ -1357,8 +1357,8 @@ def feed_compat():
                 incoming_conf=float(d["confidence"])
                 if incoming_conf>=MIN_CONF and d.get("signal") in ("CALL","PUT") and not signal_lock_active():
                     state["signal"]=d["signal"];state["confidence"]=incoming_conf
-                    now=time.time();state["signal_sent_at"]=now;state["signal_expires_at"]=now+ENTRY_SECONDS
-                    entry_seconds=entry_window_for_tf(state["timeframe"]);state["signal_lock_until"]=now+max(entry_seconds,int(TIMEFRAMES.get(state["timeframe"],60)*SIGNAL_LOCK_FRACTION));state["signal_id"]+=1;state["entry_window"]=entry_seconds
+                    now=time.time();entry_seconds=entry_window_for_tf(state["timeframe"]);state["signal_sent_at"]=now;state["signal_expires_at"]=now+entry_seconds
+                    state["signal_lock_until"]=now+max(entry_seconds,int(TIMEFRAMES.get(state["timeframe"],60)*SIGNAL_LOCK_FRACTION));state["signal_id"]+=1;state["entry_window"]=entry_seconds
             except Exception: pass
         state["feed"]="LIVE";state["last_frame"]=time.time();state["image_received"]=False;state["engine"]="JSON_FEED"
     return jsonify(ok=True,message="JSON feed accepted",asset=state.get("asset"),timeframe=state.get("timeframe"),price=state.get("price"),signal=state.get("signal"),confidence=state.get("confidence"))
