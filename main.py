@@ -1105,8 +1105,41 @@ def analyze(arr, metadata=None):
     vol=float(selected["atr"])
     dispersion=float(np.std(c[-min(30,len(c)):]))
     compression=dispersion < .12
+
+    # FLEXIBLE ATR FILTER:
+    # ATR no longer has to be strictly above its recent baseline. For short
+    # timeframes, allow a setup when ATR is rising or reasonably close to the
+    # baseline, while retaining a hard low-volatility floor. Strong directional
+    # confluence can override a marginal ATR reading, but not true compression.
+    atr_samples=[]
+    atr_window=max(15,min(40,len(c)-1))
+    for j in range(max(14,len(c)-atr_window),len(c)):
+        av=atr(c[:j+1])
+        if av>0 and math.isfinite(av):
+            atr_samples.append(float(av))
+    atr_baseline=float(np.median(atr_samples)) if atr_samples else vol
+    atr_ratio=vol/(atr_baseline+1e-12)
+    atr_rising=False
+    if len(atr_samples)>=4:
+        atr_rising=atr_samples[-1] >= atr_samples[-4]*1.015
+    atr_floor=max(0.55, float(os.getenv("ATR_HARD_FLOOR_RATIO","0.55")))
+    atr_near=max(0.78, float(os.getenv("ATR_NEAR_BASELINE_RATIO","0.78")))
+    atr_floor_ok=atr_ratio>=atr_floor
+    atr_near_ok=atr_ratio>=atr_near
+    # dominance is calculated below, so use the core-only override here.
+    atr_override=(core_bull!=core_bear and
+                  max(core_bull,core_bear)/(core_bull+core_bear+1e-9)>=0.80 and
+                  abs(float(selected["slope"]))>0)
+    volatility_ok=(not compression and atr_floor_ok and (atr_near_ok or atr_rising or atr_override))
     if compression:
         checks.append({"name":"Volatility guard","value":"BLOCKED","weight":0,"detail":"chart compression"})
+    elif volatility_ok:
+        detail=f"ATR {atr_ratio:.2f}x baseline"
+        if atr_rising: detail += " • rising"
+        if atr_override and not atr_near_ok: detail += " • momentum override"
+        checks.append({"name":"ATR volatility","value":"PASS","weight":0,"detail":detail})
+    else:
+        checks.append({"name":"ATR volatility","value":"WAIT","weight":0,"detail":f"ATR {atr_ratio:.2f}x baseline"})
 
     total=bull+bear
     edge=abs(bull-bear)/(total+1e-9)
@@ -1153,7 +1186,7 @@ def analyze(arr, metadata=None):
         core_direction==raw_candidate and fractal_ok and not fractal_conflict
         and dominance>=0.84 and total>=13.0 and strong_checks>=12
         and directional_checks>=9 and opposite_checks<=1
-        and not compression and conf>=MIN_CONF
+        and volatility_ok and conf>=MIN_CONF
     )
 
     # Selective early confirmation: the setup must persist and have strong
@@ -1168,7 +1201,7 @@ def analyze(arr, metadata=None):
         and dominance>=0.78 and total>=11.0
         and strong_checks>=10 and directional_checks>=8
         and opposite_checks<=2 and conf>=max(82.0,MIN_CONF-4.0)
-        and not compression
+        and volatility_ok
         and (fractal_ok or selected["adx"]>=18 or abs(float(selected["slope"]))>0.02)
     )
 
@@ -1321,7 +1354,26 @@ def analyze_ws_market(asset=None):
     x="bull" if f["macd"]>f["macd_signal"] and f["macd_hist"]>0 else "bear" if f["macd"]<f["macd_signal"] and f["macd_hist"]<0 else "neutral"
     add(a,4,"Alligator"); add(m,3.5,"EMA 9/20/50"); add(x,3.5,"MACD"); add("bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",1,"RSI"); add("bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",.8,"CCI"); add("bull" if f["last"]>f["wma"] and f["slope"]>0 else "bear" if f["last"]<f["wma"] and f["slope"]<0 else "neutral",1.2,"Momentum")
     direction="bull" if bull>bear else "bear" if bear>bull else "neutral"; edge=abs(bull-bear)/(bull+bear+1e-9); conf=50+49*edge; signal="CALL" if direction=="bull" else "PUT" if direction=="bear" else "WAIT"
-    if max(bull,bear)/(bull+bear+1e-9)<.72 or conf<MIN_CONF: signal="WAIT"
+
+    # Flexible ATR gate for native market data. A rising/near-baseline ATR is
+    # sufficient; strong core confluence can override a marginal ATR reading.
+    ws_atr=float(f["atr"])
+    ws_atr_series=[]
+    for j in range(max(14,len(c)-40),len(c)):
+        av=atr(c[:j+1])
+        if av>0 and math.isfinite(av): ws_atr_series.append(float(av))
+    ws_baseline=float(np.median(ws_atr_series)) if ws_atr_series else ws_atr
+    ws_ratio=ws_atr/(ws_baseline+1e-12)
+    ws_rising=len(ws_atr_series)>=4 and ws_atr_series[-1]>=ws_atr_series[-4]*1.015
+    ws_core_override=(max(bull,bear)/(bull+bear+1e-9)>=0.80 and
+                      max(bull,bear)-min(bull,bear)>=4.0)
+    ws_vol_ok=(ws_ratio>=0.55 and (ws_ratio>=0.78 or ws_rising or ws_core_override))
+    if not ws_vol_ok:
+        checks.append({"name":"ATR volatility","value":"WAIT","weight":0,"detail":f"ATR {ws_ratio:.2f}x baseline"})
+    else:
+        checks.append({"name":"ATR volatility","value":"PASS","weight":0,"detail":f"ATR {ws_ratio:.2f}x baseline"+(" • rising" if ws_rising else " • momentum override" if ws_core_override and ws_ratio<0.78 else "")})
+
+    if max(bull,bear)/(bull+bear+1e-9)<.72 or conf<MIN_CONF or not ws_vol_ok: signal="WAIT"
     return {"signal":signal,"confidence":round(conf,1),"reason":f"WS native • Alligator {a.upper()} • EMA {m.upper()} • MACD {x.upper()} • {bull:.1f} bullish / {bear:.1f} bearish","price":float(c[-1]),"indicators":{"source":"POCKET_OPTION_WEBSOCKET","asset":asset,"timeframe":tf,"analysis_granularity":analysis_granularity,"ema9":round(float(f["ema9"]),5),"ema20":round(float(f["ema20"]),5),"ema50":round(float(f["ema50"]),5),"rsi":round(float(f["rsi"]),2),"macd":round(float(f["macd"]),5),"macd_signal":round(float(f["macd_signal"]),5),"macd_hist":round(float(f["macd_hist"]),5),"cci":round(float(f["cci"]),2),"atr":round(float(f["atr"]),5),"slope":round(float(f["slope"]),5),"bull_score":round(bull,2),"bear_score":round(bear,2),"checks":checks}}
 
 def websocket_signal_worker():
