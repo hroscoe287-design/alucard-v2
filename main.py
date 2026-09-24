@@ -47,10 +47,14 @@ state = {
  "price":None,"entry":None,"entry_window":0,"feed":"DISCONNECTED","engine":"WAITING_FOR_FEED",
  "frames":0,"analyses":0,"last_frame":None,"last_analysis":None,"image_received":False,
  "signal_sent_at":None,"signal_expires_at":None,"signal_lock_until":None,"signal_id":0,
- "width":0,"height":0,"reason":"Waiting for a fresh screen frame","indicators":{},"payout":None,"otc_verified":True,"strategy":"MTF_CONFLUENCE","last_error":None
+ "width":0,"height":0,"reason":"Waiting for a fresh screen frame","indicators":{},"payout":None,"otc_verified":True,"strategy":"MTF_CONFLUENCE","last_error":None,
+ "developing_signal":"WAIT","developing_strength":0.0,"developing_since":None
 }
 lock = threading.RLock()
 history = deque(maxlen=100)
+developing_side = None
+developing_strength = 0.0
+developing_since = None
 
 
 # ========================= POCKET OPTION WEBSOCKET =========================
@@ -1110,7 +1114,12 @@ def analyze(arr, metadata=None):
     conf=50+49*edge
     signal="CALL" if bull>bear else "PUT" if bear>bull else "WAIT"
 
-    # HARD STRONG-SIGNAL GATE: core agreement + confirmed Fractal 2 reversal.
+    # ADAPTIVE RESPONSE GATE:
+    # Preserve the existing indicator scoring, but do not make a fresh
+    # Fractal-2 reversal mandatory for every entry. Fractal remains a strong
+    # confirmation; the developing setup can qualify earlier when evidence
+    # persists across analyses.
+    global developing_side, developing_strength, developing_since
     dominance=max(bull,bear)/(total+1e-9)
     strong_checks=sum(1 for x in checks if x.get("value") in ("BULLISH","BEARISH"))
     directional_checks=sum(1 for x in checks if x.get("value") == ("BULLISH" if signal=="CALL" else "BEARISH"))
@@ -1118,11 +1127,55 @@ def analyze(arr, metadata=None):
     core_direction="CALL" if core_bull>core_bear else "PUT" if core_bear>core_bull else "WAIT"
     fractal_ok=(fractal_side==("bull" if signal=="CALL" else "bear")) and fr.get("recent",False)
     fractal_conflict=(fractal_side!="neutral" and not fractal_ok)
-    # Strong reversal entries require the Fractal 2 turn and the three core
-    # families to point the same way. This intentionally produces more WAITs.
-    if (core_direction!=signal or not fractal_ok or fractal_conflict or dominance<0.84 or total<13.0 or strong_checks<12 or directional_checks<9 or opposite_checks>1 or compression or conf<MIN_CONF):
+
+    raw_candidate=signal
+    now_ts=time.time()
+    if raw_candidate in ("CALL","PUT") and core_direction==raw_candidate and not compression:
+        quality=(dominance-0.70)*2.0 + min(10,directional_checks)/10.0*0.55 - min(3,opposite_checks)/3.0*0.35
+        if selected["adx"]>=15: quality += 0.20
+        if (selected["slope"]>0 and raw_candidate=="CALL") or (selected["slope"]<0 and raw_candidate=="PUT"): quality += 0.20
+        if raw_candidate==developing_side:
+            developing_strength=min(1.0,developing_strength+0.18+max(0.0,quality)*0.08)
+        else:
+            developing_side=raw_candidate
+            developing_strength=max(0.18,min(0.45,0.22+max(0.0,quality)*0.05))
+            developing_since=now_ts
+    else:
+        developing_strength=max(0.0,developing_strength-0.12)
+        if developing_strength<=0.05:
+            developing_side=None
+            developing_since=None
+
+    developing_age=0.0 if developing_since is None else max(0.0,now_ts-developing_since)
+
+    # Full confirmation keeps the old strict behavior.
+    full_ok=(
+        core_direction==raw_candidate and fractal_ok and not fractal_conflict
+        and dominance>=0.84 and total>=13.0 and strong_checks>=12
+        and directional_checks>=9 and opposite_checks<=1
+        and not compression and conf>=MIN_CONF
+    )
+
+    # Selective early confirmation: the setup must persist and have strong
+    # directional agreement. This is deliberately harder than simply lowering
+    # MIN_CONF, so ALUCARD does not jump on every indicator twitch.
+    early_ok=(
+        raw_candidate in ("CALL","PUT")
+        and developing_side==raw_candidate
+        and developing_strength>=0.52
+        and developing_age>=1.5
+        and core_direction==raw_candidate
+        and dominance>=0.78 and total>=11.0
+        and strong_checks>=10 and directional_checks>=8
+        and opposite_checks<=2 and conf>=max(82.0,MIN_CONF-4.0)
+        and not compression
+        and (fractal_ok or selected["adx"]>=18 or abs(float(selected["slope"]))>0.02)
+    )
+
+    if not (full_ok or early_ok):
         signal="WAIT"
-    if signal=="WAIT": conf=min(conf,89.9)
+    if signal=="WAIT":
+        conf=min(conf,89.9)
 
     asset=str(metadata.get("asset") or state.get("asset") or "EURUSD_otc")
     payout=metadata.get("payout")
