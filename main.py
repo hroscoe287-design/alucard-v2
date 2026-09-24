@@ -1104,9 +1104,18 @@ def analyze(arr, metadata=None):
     # Volatility guard: extremely compressed or wildly unstable images are WAIT.
     vol=float(selected["atr"])
     dispersion=float(np.std(c[-min(30,len(c)):]))
-    compression=dispersion < .12
+    # ADAPTIVE VOLATILITY: ATR is a confirmation factor, not an automatic
+    # blocker. Only genuinely compressed price action blocks the setup.
+    atr_window=max(20,min(60,len(c)))
+    atr_baseline=float(np.mean(np.abs(np.diff(c[-atr_window:])))) if atr_window>2 else vol
+    atr_ratio=(vol/(atr_baseline+1e-9)) if atr_baseline>0 else 1.0
+    compression=(dispersion < .12 and atr_ratio < .70)
     if compression:
-        checks.append({"name":"Volatility guard","value":"BLOCKED","weight":0,"detail":"chart compression"})
+        checks.append({"name":"Volatility guard","value":"BLOCKED","weight":0,"detail":f"compressed volatility ATR ratio {atr_ratio:.2f}"})
+    elif atr_ratio < 0.85:
+        checks.append({"name":"Adaptive volatility","value":"SOFT","weight":0,"detail":f"moderate volatility ATR ratio {atr_ratio:.2f}; directional confluence allowed"})
+    else:
+        checks.append({"name":"Adaptive volatility","value":"ACTIVE","weight":0,"detail":f"ATR ratio {atr_ratio:.2f}"})
 
     total=bull+bear
     edge=abs(bull-bear)/(total+1e-9)
@@ -1210,6 +1219,7 @@ def analyze(arr, metadata=None):
     if payout is not None and not payout_ok: reasons.append(f"payout {payout:.0f}% below {payout_floor:.0f}% floor")
     if compression: reasons.append("low volatility")
     if signal=="WAIT": reasons.append("confluence gate not met")
+    if not compression and atr_ratio < 0.85: reasons.append(f"adaptive volatility ATR ratio {atr_ratio:.2f}")
     return {"signal":signal,"confidence":round(float(min(99,max(0,conf))),1),"reason":" • ".join(reasons),"price":price,"indicators":indicators}
 
 # ----------------------------- API -----------------------------------------
@@ -1321,7 +1331,15 @@ def analyze_ws_market(asset=None):
     x="bull" if f["macd"]>f["macd_signal"] and f["macd_hist"]>0 else "bear" if f["macd"]<f["macd_signal"] and f["macd_hist"]<0 else "neutral"
     add(a,4,"Alligator"); add(m,3.5,"EMA 9/20/50"); add(x,3.5,"MACD"); add("bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",1,"RSI"); add("bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",.8,"CCI"); add("bull" if f["last"]>f["wma"] and f["slope"]>0 else "bear" if f["last"]<f["wma"] and f["slope"]<0 else "neutral",1.2,"Momentum")
     direction="bull" if bull>bear else "bear" if bear>bull else "neutral"; edge=abs(bull-bear)/(bull+bear+1e-9); conf=50+49*edge; signal="CALL" if direction=="bull" else "PUT" if direction=="bear" else "WAIT"
-    if max(bull,bear)/(bull+bear+1e-9)<.72 or conf<MIN_CONF: signal="WAIT"
+    # Adaptive volatility gate for native market data: moderate ATR may pass
+    # when directional confluence is strong; only severe compression blocks.
+    atr=float(f.get("atr") or 0.0)
+    atr_series=np.asarray(c[-min(60,len(c)):],float)
+    atr_baseline=float(np.mean(np.abs(np.diff(atr_series)))) if len(atr_series)>2 else atr
+    atr_ratio=atr/(atr_baseline+1e-9) if atr_baseline>0 else 1.0
+    volatility_block=atr_ratio < 0.70
+    required_edge=0.22 if atr_ratio < 0.85 else 0.20
+    if volatility_block or max(bull,bear)/(bull+bear+1e-9)<required_edge or conf<MIN_CONF: signal="WAIT"
     return {"signal":signal,"confidence":round(conf,1),"reason":f"WS native • Alligator {a.upper()} • EMA {m.upper()} • MACD {x.upper()} • {bull:.1f} bullish / {bear:.1f} bearish","price":float(c[-1]),"indicators":{"source":"POCKET_OPTION_WEBSOCKET","asset":asset,"timeframe":tf,"analysis_granularity":analysis_granularity,"ema9":round(float(f["ema9"]),5),"ema20":round(float(f["ema20"]),5),"ema50":round(float(f["ema50"]),5),"rsi":round(float(f["rsi"]),2),"macd":round(float(f["macd"]),5),"macd_signal":round(float(f["macd_signal"]),5),"macd_hist":round(float(f["macd_hist"]),5),"cci":round(float(f["cci"]),2),"atr":round(float(f["atr"]),5),"slope":round(float(f["slope"]),5),"bull_score":round(bull,2),"bear_score":round(bear,2),"checks":checks}}
 
 def websocket_signal_worker():
