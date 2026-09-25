@@ -1053,21 +1053,61 @@ def analyze(arr, metadata=None):
         if side=="bull": core_bull+=weight
         elif side=="bear": core_bear+=weight
 
-    # Alligator structure and separation.
-    jaw=ema(c,13)[-1]; teeth=ema(c,8)[-1]; lips=ema(c,5)[-1]
+    # DOMINANT TREND ENGINE: Alligator line order + actual line movement.
+    # A static crossover is not enough: the engine now watches whether Lips,
+    # Teeth and Jaw are moving in the same direction and whether their spread
+    # is expanding or contracting. This helps reject late/opposite entries.
+    jaw_a=ema(c,13); teeth_a=ema(c,8); lips_a=ema(c,5)
+    jaw=float(jaw_a[-1]); teeth=float(teeth_a[-1]); lips=float(lips_a[-1])
     alligator_side="bull" if lips>teeth>jaw else "bear" if lips<teeth<jaw else "neutral"
-    core(alligator_side,4.0)
-    add("Alligator CORE",alligator_side,4.0,"Lips/Teeth/Jaw")
+    ag_n=min(6,len(c)-1)
+    ag_lips_s=slope(lips_a,ag_n)
+    ag_teeth_s=slope(teeth_a,ag_n)
+    ag_jaw_s=slope(jaw_a,ag_n)
+    ag_move_side="bull" if ag_lips_s>0 and ag_teeth_s>0 and ag_jaw_s>0 else "bear" if ag_lips_s<0 and ag_teeth_s<0 and ag_jaw_s<0 else "neutral"
+    ag_atr=max(float(selected["atr"]),1e-9)
+    ag_spread_now=abs(lips-jaw)
+    ag_spread_old=abs(float(lips_a[-min(ag_n,len(lips_a)-1)-1])-float(jaw_a[-min(ag_n,len(jaw_a)-1)-1])) if len(c)>ag_n+1 else ag_spread_now
+    ag_expanding=ag_spread_now>ag_spread_old*1.01
+    ag_contracting=ag_spread_now<ag_spread_old*0.985
+    ag_move_strength=min(1.0,(abs(ag_lips_s)+abs(ag_teeth_s)+abs(ag_jaw_s))/(ag_atr*0.30+1e-9))
+    ag_confirm=alligator_side==ag_move_side and alligator_side!="neutral"
+    ag_detail=f"L/T/J {alligator_side.upper()} • movement {ag_move_side.upper()} • spread {'EXPANDING' if ag_expanding else 'CONTRACTING' if ag_contracting else 'FLAT'}"
+    if ag_confirm:
+        core(alligator_side,7.0 + 2.0*ag_move_strength + (0.8 if ag_expanding else -0.4 if ag_contracting else 0.0))
+    elif alligator_side!="neutral":
+        core(alligator_side,4.5)
+    add("Alligator CORE",alligator_side,7.0,ag_detail)
+    if ag_confirm and ag_expanding:
+        add("Alligator LINE MOVEMENT",alligator_side,2.0,f"aligned slopes; spread +{ag_spread_now/(ag_spread_old+1e-9)-1:.1%}")
+    elif ag_confirm:
+        add("Alligator LINE MOVEMENT",alligator_side,1.0,"aligned movement")
+    elif alligator_side!="neutral":
+        add("Alligator LINE MOVEMENT","neutral",0.0,"line movement conflicts with alignment")
 
     # Moving-average alignment: EMA 9/20/50.
     ma_side="bull" if selected["ema9"]>selected["ema20"]>selected["ema50"] else "bear" if selected["ema9"]<selected["ema20"]<selected["ema50"] else "neutral"
-    core(ma_side,3.5)
-    add("Moving Averages CORE",ma_side,3.5,"EMA 9/20/50 alignment")
+    core(ma_side,3.0)
+    add("Moving Averages CORE",ma_side,3.0,"EMA 9/20/50 alignment")
 
-    # MACD direction plus histogram momentum.
-    macd_side="bull" if selected["macd"]>selected["macd_signal"] and selected["macd_hist"]>0 else "bear" if selected["macd"]<selected["macd_signal"] and selected["macd_hist"]<0 else "neutral"
-    core(macd_side,3.5)
-    add("MACD CORE",macd_side,3.5,f"hist {selected['macd_hist']:.5f}")
+    # MACD: direction + crossover + histogram direction. A positive histogram
+    # that is shrinking is treated differently from one that is accelerating.
+    macd_line=ema(c,12)-ema(c,26)
+    macd_sig=ema(macd_line,9)
+    macd_hist=macd_line-macd_sig
+    macd_hist_now=float(macd_hist[-1]); macd_hist_prev=float(macd_hist[-2]) if len(macd_hist)>1 else macd_hist_now
+    macd_hist_prev2=float(macd_hist[-3]) if len(macd_hist)>2 else macd_hist_prev
+    macd_accel=macd_hist_now-macd_hist_prev
+    macd_side="bull" if macd_line[-1]>macd_sig[-1] and macd_hist_now>0 else "bear" if macd_line[-1]<macd_sig[-1] and macd_hist_now<0 else "neutral"
+    macd_move_side="bull" if macd_hist_now>macd_hist_prev and macd_hist_prev>=macd_hist_prev2 else "bear" if macd_hist_now<macd_hist_prev and macd_hist_prev<=macd_hist_prev2 else "neutral"
+    macd_confirm=macd_side==macd_move_side and macd_side!="neutral"
+    macd_strength=1.0 if macd_confirm else 0.55 if macd_side!="neutral" else 0.0
+    core(macd_side,6.0 + 2.0*macd_strength)
+    add("MACD CORE",macd_side,6.0,f"hist {macd_hist_now:.5f} • momentum {macd_move_side.upper()} • Δ {macd_accel:.5f}")
+    if macd_confirm:
+        add("MACD MOMENTUM",macd_side,2.0,"histogram accelerating in signal direction")
+    elif macd_side!="neutral":
+        add("MACD MOMENTUM","neutral",0.0,"histogram is losing directional agreement")
 
     # Multi-timeframe agreement reinforces the core but never replaces it.
     for name,f in views:
@@ -1076,7 +1116,13 @@ def analyze(arr, metadata=None):
         add(f"{tag} EMA 20/50","bull" if f["ema20"]>f["ema50"] else "bear" if f["ema20"]<f["ema50"] else "neutral",w*.8)
         add(f"{tag} MACD","bull" if f["macd_hist"]>0 else "bear" if f["macd_hist"]<0 else "neutral",w*.9)
         add(f"{tag} RSI","bull" if 52<=f["rsi"]<=72 else "bear" if 28<=f["rsi"]<=48 else "neutral",w*.55)
-        add(f"{tag} CCI","bull" if f["cci"]>50 else "bear" if f["cci"]<-50 else "neutral",w*.45)
+        # CCI is confirmation by TREND, not a static +50/-50 trigger.
+        fc=f["close"]
+        c_now=float(f["cci"])
+        c_prev=float(cci(fc[:-1])) if len(fc)>21 else c_now
+        c_prev2=float(cci(fc[:-2])) if len(fc)>22 else c_prev
+        c_trend="bull" if c_now>c_prev and c_prev>=c_prev2 else "bear" if c_now<c_prev and c_prev<=c_prev2 else "neutral"
+        add(f"{tag} CCI TREND",c_trend,w*.70,f"{c_prev2:.1f} → {c_prev:.1f} → {c_now:.1f}")
         add(f"{tag} Momentum","bull" if f["last"]>f["wma"] and f["body"]>0 else "bear" if f["last"]<f["wma"] and f["body"]<0 else "neutral",w*.55)
 
     # Fractal 2 is deliberately reversal-focused. It is a strong bonus when
@@ -1233,12 +1279,15 @@ def analyze(arr, metadata=None):
       "cci":round(float(selected["cci"]),2),"atr":round(float(selected["atr"]),5),"slope":round(float(selected["slope"]),5),
       "stoch":round(float(selected["stoch"]),2),"adx":round(float(selected["adx"]),2),
       "alligator":"BULL" if lips>teeth>jaw else "BEAR" if lips<teeth<jaw else "MIXED",
-      "core_engine":{"alligator":alligator_side.upper(),"moving_averages":ma_side.upper(),"macd":macd_side.upper(),"direction":core_direction},
+      "alligator_movement":ag_move_side.upper(),"alligator_spread":"EXPANDING" if ag_expanding else "CONTRACTING" if ag_contracting else "FLAT",
+      "macd_momentum":macd_move_side.upper(),
+      "cci_trend":("RISING" if selected["cci"] > (cci(c[:-1]) if len(c)>21 else selected["cci"]) else "FALLING" if selected["cci"] < (cci(c[:-1]) if len(c)>21 else selected["cci"]) else "FLAT"),
+      "core_engine":{"alligator":alligator_side.upper(),"alligator_movement":ag_move_side.upper(),"moving_averages":ma_side.upper(),"macd":macd_side.upper(),"macd_momentum":macd_move_side.upper(),"direction":core_direction},
       "fractal2":fr,
       "bull_pixels":round(green,4),"bear_pixels":round(red,4),"bull_score":round(bull,2),"bear_score":round(bear,2),
       "checks":checks
     }
-    reasons=[f"CORE: Alligator {alligator_side.upper()} • MA {ma_side.upper()} • MACD {macd_side.upper()}",f"Fractal 2: {fr.get('reversal','NONE')}",f"{bull:.1f} bullish / {bear:.1f} bearish",f"MTF: {','.join(n for n,_ in views)}"]
+    reasons=[f"CORE: Alligator {alligator_side.upper()} / movement {ag_move_side.upper()} • MACD {macd_side.upper()} / momentum {macd_move_side.upper()} • CCI TREND monitored",f"Fractal 2: {fr.get('reversal','NONE')}",f"{bull:.1f} bullish / {bear:.1f} bearish",f"MTF: {','.join(n for n,_ in views)}"]
     if otc: reasons.append("OTC asset mode")
     if payout is not None and not payout_ok: reasons.append(f"payout {payout:.0f}% below {payout_floor:.0f}% floor")
     if compression: reasons.append("low volatility")
