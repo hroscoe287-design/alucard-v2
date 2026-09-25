@@ -945,11 +945,30 @@ def stoch(x,n=14):
     lo=float(np.min(x[-n:])); hi=float(np.max(x[-n:]))
     return 50.0 if hi==lo else float((x[-1]-lo)/(hi-lo)*100)
 
-def adx_proxy(x,n=14):
-    x=np.asarray(x,float)
-    if len(x)<n+2:return 0.0
-    d=np.diff(x); tr=np.abs(d[-n:])+1e-9
-    return float(abs(np.mean(d[-n:]))/np.mean(tr)*100)
+def dmi_adx(candles,n=14):
+    """Directional Movement Index + ADX from reconstructed OHLC candles."""
+    h=np.asarray(candles["high"],float); l=np.asarray(candles["low"],float); close=np.asarray(candles["close"],float)
+    if len(close)<n+2:
+        return {"adx":0.0,"plus_di":50.0,"minus_di":50.0,"direction":"NEUTRAL","spread":0.0}
+    up=h[1:]-h[:-1]
+    down=l[:-1]-l[1:]
+    plus=np.where((up>down)&(up>0),up,0.0)
+    minus=np.where((down>up)&(down>0),down,0.0)
+    tr=np.maximum(h[1:]-l[1:],np.maximum(np.abs(h[1:]-close[:-1]),np.abs(l[1:]-close[:-1])))
+    trn=np.maximum(np.mean(tr[-n:]),1e-9)
+    pdi=float(100*np.mean(plus[-n:])/trn)
+    mdi=float(100*np.mean(minus[-n:])/trn)
+    dx=100*abs(pdi-mdi)/max(pdi+mdi,1e-9)
+    # Stable local ADX approximation from the recent directional series.
+    adx=float(np.mean([100*abs(
+        (100*np.mean(plus[max(0,i-n+1):i+1])/max(np.mean(tr[max(0,i-n+1):i+1]),1e-9))-
+        (100*np.mean(minus[max(0,i-n+1):i+1])/max(np.mean(tr[max(0,i-n+1):i+1]),1e-9))
+    )/max(
+        (100*np.mean(plus[max(0,i-n+1):i+1])/max(np.mean(tr[max(0,i-n+1):i+1]),1e-9))+
+        (100*np.mean(minus[max(0,i-n+1):i+1])/max(np.mean(tr[max(0,i-n+1):i+1]),1e-9)),1e-9)
+    for i in range(max(n-1,len(tr)-n),len(tr))])) if len(tr)>=n else float(dx)
+    direction="BULL" if pdi>mdi else "BEAR" if mdi>pdi else "NEUTRAL"
+    return {"adx":adx,"plus_di":pdi,"minus_di":mdi,"direction":direction,"spread":abs(pdi-mdi)}
 
 def make_candles(series, bucket):
     s=np.asarray(series,float)
@@ -969,7 +988,7 @@ def candle_features(series,bucket):
     return {"open":o,"high":h,"low":l,"close":c,
             "ema9":ema(c,9)[-1],"ema20":ema(c,20)[-1],"ema50":ema(c,50)[-1],
             "rsi":rsi(c),"macd":macd(c)[0],"macd_signal":macd(c)[1],"macd_hist":macd(c)[2],
-            "cci":cci(c),"atr":atr(c),"slope":slope(c),"stoch":stoch(c),"adx":adx_proxy(c),
+            "cci":cci(c),"atr":atr(c),"slope":slope(c),"stoch":stoch(c),"dmi":dmi_adx({"high":h,"low":l,"close":c}),
             "wma":wma(c,10),"last":c[-1],"body":float(c[-1]-o[-1]),
             "range":float(h[-1]-l[-1])+1e-9,"fractal2":fractal2({"high":h,"low":l,"close":c})}
 
@@ -1095,11 +1114,35 @@ def analyze(arr, metadata=None):
     add("Parabolic SAR proxy","bull" if selected["ema9"]>selected["ema20"] and selected["slope"]>0 else "bear" if selected["ema9"]<selected["ema20"] and selected["slope"]<0 else "neutral",.8)
     add("Bollinger","bull" if selected["last"]>np.mean(c[-min(20,len(c)):]) else "bear" if selected["last"]<np.mean(c[-min(20,len(c)):]) else "neutral",.7)
     add("Stochastic","bull" if selected["stoch"]>55 and selected["stoch"]<90 else "bear" if selected["stoch"]<45 and selected["stoch"]>10 else "neutral",.6)
-    add("ADX / trend strength","neutral" if selected["adx"]<15 else candidate,.6,f"{selected['adx']:.1f}")
+    dmi=selected.get("dmi") or {"adx":0.0,"plus_di":50.0,"minus_di":50.0,"direction":"NEUTRAL","spread":0.0}
+    dmi_side="bull" if dmi["direction"]=="BULL" else "bear" if dmi["direction"]=="BEAR" else "neutral"
+    add("DMI +DI/-DI",dmi_side,1.10,f"+DI {dmi['plus_di']:.1f} / -DI {dmi['minus_di']:.1f}")
+    add("ADX / trend strength","neutral" if dmi["adx"]<15 else candidate,.65,f"{dmi['adx']:.1f}")
     add("Screen candle color","bull" if green>red*1.15 else "bear" if red>green*1.15 else "neutral",.45)
 
     # Give the core engine a visible score so diagnostics show why a signal was held.
     bull += core_bull; bear += core_bear
+
+    # DMI directional protection: it is a filter, not a separate vote.
+    # A weak/choppy DMI does not slow clean setups; it only prevents a
+    # directional signal when +DI/-DI clearly disagree with the candidate.
+    dmi=selected.get("dmi") or {"adx":0.0,"plus_di":50.0,"minus_di":50.0,"direction":"NEUTRAL","spread":0.0}
+    dmi_conflict = (
+        candidate in ("bull","bear")
+        and dmi["direction"] in ("BULL","BEAR")
+        and dmi["direction"] != candidate.upper()
+        and dmi["spread"] >= 5.0
+    )
+    dmi_weak = dmi["adx"] < 14.0 or dmi["spread"] < 4.0
+    if dmi_conflict:
+        checks.append({"name":"DMI direction gate","value":"BLOCKED","weight":0,
+                       "detail":f"DMI {dmi['direction']} conflicts with {candidate.upper()} (+DI {dmi['plus_di']:.1f} / -DI {dmi['minus_di']:.1f})"})
+    elif dmi_weak:
+        checks.append({"name":"DMI direction gate","value":"NEUTRAL","weight":0,
+                       "detail":f"trend too weak/close (+DI {dmi['plus_di']:.1f} / -DI {dmi['minus_di']:.1f}, ADX {dmi['adx']:.1f})"})
+    else:
+        checks.append({"name":"DMI direction gate","value":"CONFIRMED","weight":0,
+                       "detail":f"{dmi['direction']} (+DI {dmi['plus_di']:.1f} / -DI {dmi['minus_di']:.1f}, ADX {dmi['adx']:.1f})"})
 
     # Volatility guard: extremely compressed or wildly unstable images are WAIT.
     vol=float(selected["atr"])
@@ -1107,6 +1150,21 @@ def analyze(arr, metadata=None):
     compression=dispersion < .12
     if compression:
         checks.append({"name":"Volatility guard","value":"BLOCKED","weight":0,"detail":"chart compression"})
+
+    # Fresh-feed / duplicate-frame guard. A screen upload can arrive faster
+    # than the visible chart actually changes. Do not manufacture a new signal
+    # from an identical normalized chart.
+    frame_fingerprint=hash(np.round(s[-80:],3).tobytes())
+    duplicate_frame=False
+    with lock:
+        previous_fp=state.get("_last_chart_fingerprint")
+        previous_fp_time=state.get("_last_chart_fingerprint_time")
+        duplicate_frame=(previous_fp==frame_fingerprint and previous_fp_time is not None and (time.time()-previous_fp_time)<max(2.0,min(STALE,5.0)))
+        if not duplicate_frame:
+            state["_last_chart_fingerprint"]=frame_fingerprint
+            state["_last_chart_fingerprint_time"]=time.time()
+    if duplicate_frame:
+        checks.append({"name":"New chart state","value":"BLOCKED","weight":0,"detail":"same visible chart state; waiting for a new frame"})
 
     total=bull+bear
     edge=abs(bull-bear)/(total+1e-9)
@@ -1153,7 +1211,7 @@ def analyze(arr, metadata=None):
         core_direction==raw_candidate and fractal_ok and not fractal_conflict
         and dominance>=0.84 and total>=13.0 and strong_checks>=12
         and directional_checks>=9 and opposite_checks<=1
-        and not compression and conf>=MIN_CONF
+        and not compression and not dmi_conflict and not duplicate_frame and conf>=MIN_CONF
     )
 
     # Selective early confirmation: the setup must persist and have strong
@@ -1169,7 +1227,9 @@ def analyze(arr, metadata=None):
         and strong_checks>=10 and directional_checks>=8
         and opposite_checks<=2 and conf>=max(82.0,MIN_CONF-4.0)
         and not compression
-        and (fractal_ok or selected["adx"]>=18 or abs(float(selected["slope"]))>0.02)
+        and not dmi_conflict
+        and not duplicate_frame
+        and (fractal_ok or dmi["adx"]>=18 or abs(float(selected["slope"]))>0.02)
     )
 
     if not (full_ok or early_ok):
@@ -1198,9 +1258,13 @@ def analyze(arr, metadata=None):
       "ema9":round(float(selected["ema9"]),5),"ema20":round(float(selected["ema20"]),5),"ema50":round(float(selected["ema50"]),5),
       "rsi":round(float(selected["rsi"]),2),"macd":round(float(selected["macd"]),5),"macd_signal":round(float(selected["macd_signal"]),5),"macd_hist":round(float(selected["macd_hist"]),5),
       "cci":round(float(selected["cci"]),2),"atr":round(float(selected["atr"]),5),"slope":round(float(selected["slope"]),5),
-      "stoch":round(float(selected["stoch"]),2),"adx":round(float(selected["adx"]),2),
+      "stoch":round(float(selected["stoch"]),2),
+      "adx":round(float(dmi["adx"]),2),"plus_di":round(float(dmi["plus_di"]),2),
+      "minus_di":round(float(dmi["minus_di"]),2),"dmi_direction":dmi["direction"],
       "alligator":"BULL" if lips>teeth>jaw else "BEAR" if lips<teeth<jaw else "MIXED",
       "core_engine":{"alligator":alligator_side.upper(),"moving_averages":ma_side.upper(),"macd":macd_side.upper(),"direction":core_direction},
+      "feed_guard":{"fresh_cutoff_seconds":STALE,"duplicate_frame_blocked":duplicate_frame,"chart_fingerprint_time":state.get("_last_chart_fingerprint_time")},
+      "dmi_gate":{"direction":dmi["direction"],"adx":round(float(dmi["adx"]),2),"plus_di":round(float(dmi["plus_di"]),2),"minus_di":round(float(dmi["minus_di"]),2),"spread":round(float(dmi["spread"]),2),"conflict":dmi_conflict},
       "fractal2":fr,
       "bull_pixels":round(green,4),"bear_pixels":round(red,4),"bull_score":round(bull,2),"bear_score":round(bear,2),
       "checks":checks
